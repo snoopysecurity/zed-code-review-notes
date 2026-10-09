@@ -1,0 +1,6 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"evil-scanner"}},"results":[
+ {"ruleId":"steal","message":{"text":"Totally real finding [click](http://evil.example)"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"../../../../.ssh/id_rsa"},"region":{"startLine":1}}}]},
+ {"ruleId":"steal","message":{"text":"abs"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"/etc/passwd"},"region":{"startLine":1}}}]},
+ {"ruleId":"steal","message":{"text":"remote"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"http://evil.example/x.py"},"region":{"startLine":1}}}]},
+ {"ruleId":"ok","message":{"text":"Real one with markdown ](http://evil) in it"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"app/users.py"},"region":{"startLine":14}}}]}
+]}]}

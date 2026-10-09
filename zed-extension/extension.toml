@@ -1,0 +1,28 @@
+id = "code-review-notes"
+name = "Code Review Notes"
+version = "0.1.0"
+schema_version = 1
+authors = ["Sam Sanoop <ssanoop@gitlab.com>"]
+description = "Keep notes on code during a review, and import SAST findings (SARIF, brakeman)."
+repository = "https://github.com/OWNER/code-review-notes"  # TODO: the real GitHub URL, before publishing
+
+[language_servers.code-review-notes]
+name = "Code Review Notes"
+# Names must match each language's `name` in Zed exactly; there is no
+# wildcard. Languages from extensions that are not installed are ignored.
+# "Plain Text" is what Zed gives every file no language claims (`.rb` without
+# the Ruby extension, say), so notes work there too.
+languages = [
+  # Built into Zed
+  "C", "C++", "CSS", "Diff", "Env", "Git Commit", "Go", "Go Mod", "Go Work",
+  "JavaScript", "JSON", "JSONC", "Markdown", "Plain Text", "Python", "Rust",
+  "Shell Script", "TSX", "TypeScript", "YAML",
+  # From extensions
+  "Alex", "Astro", "Cabal", "CSharp", "Dart", "Docker Compose", "Dockerfile",
+  "EEx", "Elixir", "Elm", "ERB", "Erlang", "GLSL", "Gradle", "Gradle KTS",
+  "GraphQL", "Groovy", "Haskell", "HCL", "HEEx", "HTML", "HTML+ERB", "Java",
+  "JS+ERB", "Kotlin", "Literate Haskell", "Lua", "Make", "Nix", "OCaml",
+  "OCaml Interface", "PHP", "Properties", "Proto", "RBS", "Reason", "Ruby",
+  "Scala", "Solidity", "SQL", "Svelte", "Swift", "Terraform", "Terraform Vars",
+  "TOML", "Vue.js", "XML", "YAML+ERB", "Yul", "Zig",
+]

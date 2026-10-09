@@ -1,0 +1,80 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "SnykCode",
+          "semanticVersion": "1.0.0",
+          "version": "1.0.0",
+          "rules": [
+            {
+              "id": "python/Sqli",
+              "name": "Sqli",
+              "shortDescription": { "text": "SQL Injection" },
+              "defaultConfiguration": { "level": "error" },
+              "help": { "markdown": "## Details\n...", "text": "" },
+              "properties": { "tags": ["python", "Sqli", "Security"], "cwe": ["CWE-89"] }
+            },
+            {
+              "id": "python/CommandInjection",
+              "name": "CommandInjection",
+              "shortDescription": { "text": "Command Injection" },
+              "defaultConfiguration": { "level": "error" }
+            },
+            {
+              "id": "ruby/OpenRedirect",
+              "name": "OpenRedirect",
+              "shortDescription": { "text": "Open Redirect" },
+              "defaultConfiguration": { "level": "warning" }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "python/Sqli",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "Unsanitized input from a function argument flows into execute, where it is used in an SQL query. This may result in an SQL Injection vulnerability.",
+            "markdown": "Unsanitized input from {0} {1} into {2}, where it is used in an SQL query. This may result in an SQL Injection vulnerability.",
+            "arguments": ["[a function argument](0)", "[flows](1)", "[execute](2)"]
+          },
+          "locations": [
+            { "physicalLocation": { "artifactLocation": { "uri": "app/users.py", "uriBaseId": "%SRCROOT%" }, "region": { "startLine": 9, "endLine": 9, "startColumn": 5, "endColumn": 19 } } }
+          ],
+          "fingerprints": { "0": "6f0e7c1c0a8b3d2e", "1": "a1b2c3d4.4773f344.607187b5" },
+          "properties": { "priorityScore": 813, "isAutofixable": false }
+        },
+        {
+          "ruleId": "python/CommandInjection",
+          "ruleIndex": 1,
+          "level": "error",
+          "message": {
+            "text": "Unsanitized input from a function argument flows into subprocess.check_output, where it is used as a shell command. This may result in a Command Injection vulnerability.",
+            "markdown": "Unsanitized input from {0} {1} into {2}, where it is used as a shell command.",
+            "arguments": ["[a function argument](0)", "[flows](1)", "[subprocess.check_output](2)"]
+          },
+          "locations": [
+            { "physicalLocation": { "artifactLocation": { "uri": "app/users.py", "uriBaseId": "%SRCROOT%" }, "region": { "startLine": 14, "endLine": 14, "startColumn": 12, "endColumn": 35 } } }
+          ]
+        },
+        {
+          "ruleId": "ruby/OpenRedirect",
+          "ruleIndex": 2,
+          "level": "warning",
+          "message": { "text": "Unsanitized input from the HTTP request parameters flows into redirect_to, where it is used as a URL to redirect the user." },
+          "locations": [
+            { "physicalLocation": { "artifactLocation": { "uri": "app/controllers/users_controller.rb", "uriBaseId": "%SRCROOT%" }, "region": { "startLine": 7, "endLine": 7, "startColumn": 5, "endColumn": 33 } } }
+          ],
+          "suppressions": [
+            { "kind": "external", "justification": "Only internal paths reach here", "properties": { "category": "not-vulnerable", "ignoredBy": { "name": "Reviewer" } } }
+          ]
+        }
+      ],
+      "properties": { "coverage": [{ "files": 2, "isSupported": true, "lang": "Python" }] }
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "CodeQL",
+          "organization": "GitHub",
+          "semanticVersion": "2.19.3",
+          "notifications": [{ "id": "py/baseline/expected-extracted-files", "name": "py/baseline/expected-extracted-files" }],
+          "rules": []
+        },
+        "extensions": [
+          {
+            "name": "codeql/python-queries",
+            "semanticVersion": "1.3.2",
+            "rules": [
+              {
+                "id": "py/sql-injection",
+                "name": "py/sql-injection",
+                "shortDescription": { "text": "SQL query built from user-controlled sources" },
+                "defaultConfiguration": { "enabled": true, "level": "error" },
+                "properties": { "precision": "high", "security-severity": "8.8", "tags": ["security", "external/cwe/cwe-089"] }
+              },
+              {
+                "id": "py/command-line-injection",
+                "name": "py/command-line-injection",
+                "shortDescription": { "text": "Uncontrolled command line" },
+                "defaultConfiguration": { "enabled": true, "level": "error" },
+                "properties": { "precision": "high", "security-severity": "9.8" }
+              }
+            ]
+          }
+        ]
+      },
+      "artifacts": [{ "location": { "uri": "app/users.py", "uriBaseId": "%SRCROOT%", "index": 0 } }],
+      "results": [
+        {
+          "ruleId": "py/sql-injection",
+          "rule": { "id": "py/sql-injection", "index": 0, "toolComponent": { "index": 0 } },
+          "message": { "text": "This SQL query depends on a [user-provided value](1)." },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "app/users.py", "uriBaseId": "%SRCROOT%", "index": 0 },
+                "region": { "startLine": 9, "startColumn": 20, "endColumn": 63 }
+              }
+            }
+          ],
+          "partialFingerprints": { "primaryLocationLineHash": "7e3ab0f6c8a1d9e2:1" },
+          "codeFlows": [{ "threadFlows": [{ "locations": [
+            { "location": { "physicalLocation": { "artifactLocation": { "uri": "app/users.py", "uriBaseId": "%SRCROOT%", "index": 0 }, "region": { "startLine": 7, "startColumn": 10, "endColumn": 17 } }, "message": { "text": "ControlFlowNode for user_id" } } },
+            { "location": { "physicalLocation": { "artifactLocation": { "uri": "app/users.py", "uriBaseId": "%SRCROOT%", "index": 0 }, "region": { "startLine": 9, "startColumn": 20, "endColumn": 63 } }, "message": { "text": "ControlFlowNode for Fstring" } } }
+          ] }] }],
+          "relatedLocations": [
+            { "id": 1, "physicalLocation": { "artifactLocation": { "uri": "app/users.py", "uriBaseId": "%SRCROOT%", "index": 0 }, "region": { "startLine": 7, "startColumn": 10, "endColumn": 17 } }, "message": { "text": "user-provided value" } }
+          ]
+        },
+        {
+          "ruleId": "py/command-line-injection",
+          "rule": { "id": "py/command-line-injection", "index": 1, "toolComponent": { "index": 0 } },
+          "message": { "text": "This command line depends on a [user-provided value](1)." },
+          "locations": [
+            { "physicalLocation": { "artifactLocation": { "index": 0 }, "region": { "startLine": 14, "startColumn": 35, "endColumn": 54 } } }
+          ],
+          "relatedLocations": [
+            { "id": 1, "physicalLocation": { "artifactLocation": { "index": 0 }, "region": { "startLine": 13, "startColumn": 10, "endColumn": 14 } }, "message": { "text": "user-provided value" } }
+          ]
+        }
+      ],
+      "columnKind": "unicodeCodePoints",
+      "properties": { "semmle.formatSpecifier": "sarif-latest" }
+    },
+    {
+      "tool": {
+        "driver": { "name": "CodeQL", "semanticVersion": "2.19.3", "rules": [] },
+        "extensions": [
+          {
+            "name": "codeql/ruby-queries",
+            "rules": [
+              { "id": "rb/sql-injection", "shortDescription": { "text": "SQL query built from user-controlled sources" }, "defaultConfiguration": { "level": "error" } },
+              { "id": "rb/url-redirection", "shortDescription": { "text": "URL redirection from remote source" }, "defaultConfiguration": { "level": "error" } }
+            ]
+          }
+        ]
+      },
+      "artifacts": [{ "location": { "uri": "app/controllers/users_controller.rb", "uriBaseId": "%SRCROOT%", "index": 0 } }],
+      "results": [
+        {
+          "ruleId": "rb/sql-injection",
+          "rule": { "id": "rb/sql-injection", "index": 0, "toolComponent": { "index": 0 } },
+          "message": { "text": "This SQL query depends on a [user-provided value](1)." },
+          "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "app/controllers/users_controller.rb", "uriBaseId": "%SRCROOT%", "index": 0 }, "region": { "startLine": 3, "startColumn": 30, "endColumn": 76 } } }]
+        },
+        {
+          "ruleId": "rb/url-redirection",
+          "rule": { "id": "rb/url-redirection", "index": 1, "toolComponent": { "index": 0 } },
+          "message": { "text": "Untrusted URL redirection depends on a [user-provided value](1)." },
+          "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "app/controllers/users_controller.rb", "uriBaseId": "%SRCROOT%", "index": 0 }, "region": { "startLine": 7, "startColumn": 17, "endColumn": 29 } } }]
+        }
+      ],
+      "columnKind": "unicodeCodePoints"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+rules:
+  - id: python-fstring-sql
+    languages: [python]
+    severity: ERROR
+    message: SQL query built with an f-string; use parameters instead
+    pattern: $CUR.execute(f"...")
+  - id: python-shell-true
+    languages: [python]
+    severity: WARNING
+    message: subprocess call with shell=True and concatenated input
+    pattern: subprocess.check_output($X + $Y, shell=True)

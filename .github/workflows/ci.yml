@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the toolchain, components and wasm target from rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - name: End-to-end LSP test
+        run: cargo build && python3 scripts/lsp_e2e.py
+
+  extension:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zed-extension
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-wasip2 -- -D warnings

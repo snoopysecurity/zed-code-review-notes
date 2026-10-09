@@ -1,0 +1,75 @@
+---
+source: code-review-notes/src/export.rs
+expression: out
+---
+# Code review: demo
+
+5 notes · 1 Issue · 1 Open · 1 OK · 1 removed\_status · 1 Stale · generated 2026-10-09
+
+## Issue
+
+### SQL injection \]\(http://evil\)
+
+`a.py:3-4` · semgrep · rule `python.sqli` · alice · 2026-10-01
+
+```
+db.query(f"{id}")
+```
+
+Reachable from **/users**.
+
+---
+
+## Open
+
+### Check this
+
+`b.py:9-10` · semgrep · rule `python.sqli` · alice · 2026-10-01
+
+```
+eval(x)
+```
+
+Not sure yet.
+
+---
+
+## OK
+
+### Constant input
+
+`a.py:1-2` · semgrep · rule `python.sqli` · alice · 2026-10-01
+
+```
+run("ls")
+```
+
+---
+
+## removed\_status
+
+### Status no longer configured
+
+`d.py:1-2` · semgrep · rule `python.sqli` · alice · 2026-10-01
+
+```
+x
+```
+
+---
+
+## Stale
+
+### Fence test
+
+`c.md:1-2` · Issue · semgrep · rule `python.sqli` · alice · 2026-10-01
+
+`````
+````
+code
+````
+`````
+
+_The code this note was made on can no longer be found; the snippet above is the original._
+
+---

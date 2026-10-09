@@ -1,0 +1,51 @@
+{
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "spec-edges",
+          "rules": [{ "id": "E1", "messageStrings": { "default": { "text": "Tainted {0} reaches {1}; literal {{braces}}" } } }],
+          "globalMessageStrings": { "global": { "text": "Global template for {0}" } }
+        }
+      },
+      "originalUriBaseIds": {
+        "REPO": { "uri": "file:///home/runner/work/demo/" },
+        "SRCROOT": { "uri": "demo/", "uriBaseId": "REPO" }
+      },
+      "artifacts": [{ "location": { "uri": "app/users.py", "uriBaseId": "SRCROOT" } }],
+      "results": [
+        {
+          "ruleId": "E1/fstring",
+          "message": { "id": "default", "arguments": ["user_id", "execute"] },
+          "locations": [
+            { "physicalLocation": { "artifactLocation": { "uri": "app/users.py", "uriBaseId": "SRCROOT" } } },
+            { "physicalLocation": { "artifactLocation": { "index": 0 }, "region": { "startLine": 9 } } }
+          ]
+        },
+        {
+          "ruleId": "E2",
+          "message": { "id": "global", "arguments": ["host"] },
+          "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "file:///home/runner/work/demo/demo/app/users.py" }, "region": { "startLine": 14 } } }],
+          "suppressions": [{ "kind": "inSource", "status": "underReview" }]
+        },
+        { "ruleId": "E3", "kind": "pass", "message": { "text": "passed" }, "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "app/users.py" }, "region": { "startLine": 19 } } }] },
+        { "ruleId": "E3", "baselineState": "absent", "message": { "text": "fixed" }, "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "app/users.py" }, "region": { "startLine": 19 } } }] },
+        { "ruleId": "E3", "message": { "text": "suppressed" }, "suppressions": [{ "kind": "inSource" }], "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "app/users.py" }, "region": { "startLine": 19 } } }] },
+        { "ruleId": "E4", "message": { "text": "escape through the CI root" }, "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "file:///home/runner/work/demo/demo/../../../../../etc/passwd" }, "region": { "startLine": 1 } } }] },
+        { "ruleId": "E5", "message": { "text": "nowhere" } }
+      ]
+    },
+    {
+      "tool": { "driver": { "name": "wd-tool" } },
+      "invocations": [{ "executionSuccessful": true, "workingDirectory": { "uri": "file:///builds/group/demo/" } }],
+      "results": [
+        {
+          "ruleId": "W1",
+          "message": { "text": "Query interpolates {{params}}: \\[id\\] reaches [the query](2), see [docs](https://example.com)" },
+          "locations": [{ "physicalLocation": { "artifactLocation": { "uri": "/builds/group/demo/app/controllers/users_controller.rb" }, "region": { "startLine": 3 } } }]
+        }
+      ]
+    }
+  ]
+}
