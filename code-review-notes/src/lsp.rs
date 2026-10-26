@@ -1,12 +1,7 @@
-//! The language server Zed talks to.
-//!
-//! Notes are shown as diagnostics on the lines they cover, with the note text
-//! on hover. Code actions add a note, change its status, open it, delete it,
-//! or import an open scanner report. Every change is written to
-//! `.code-review-notes/`; statuses come from its `config.toml`.
+//! LSP server for Zed. Notes become diagnostics on the lines they cover;
+//! code actions add, triage, open, delete and import them.
 
 use anyhow::Context;
-use chrono::{SubsecRound, Utc};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     ApplyWorkspaceEditParams, CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
@@ -14,35 +9,42 @@ use lsp_types::{
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     ExecuteCommandOptions, ExecuteCommandParams, FileSystemWatcher, GlobPattern, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, Location, MarkupContent,
-    MarkupKind, MessageType, NumberOrString, OneOf, Position, PublishDiagnosticsParams, Range,
-    Registration, RegistrationParams, ServerCapabilities, ShowDocumentParams, ShowMessageParams,
+    HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InlayHint,
+    InlayHintLabel, InlayHintParams, Location, MarkupContent, MarkupKind, MessageType,
+    NumberOrString, OneOf, Position, PublishDiagnosticsParams, Range, Registration,
+    RegistrationParams, ServerCapabilities, ShowDocumentParams, ShowMessageParams,
     SymbolInformation, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind,
     TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Value, json};
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::anchor::{self, Anchor};
 use crate::config::{self, Config, Severity};
 use crate::import;
-use crate::markdown::{inline_code, md_escape};
-use crate::note::{Meta, Note};
+use crate::markdown::{defuse_links, inline_code, md_escape};
+use crate::note::{Note, PLACEHOLDER_TITLE};
 use crate::safety::{self, MAX_SOURCE_BYTES};
-use crate::store::{self, Store};
+use crate::store::{self, LoadError, Store};
 
 const CMD_ADD: &str = "codeReviewNotes.addNote";
 const CMD_STATUS: &str = "codeReviewNotes.setStatus";
 const CMD_OPEN: &str = "codeReviewNotes.openNote";
 const CMD_DELETE: &str = "codeReviewNotes.deleteNote";
 const CMD_IMPORT: &str = "codeReviewNotes.import";
+const CMD_ACCEPT: &str = "codeReviewNotes.acceptChange";
 const NAME: &str = "Code Review Notes";
+/// Small `.json` files get re-sniffed for report content on every edit,
+/// bigger ones only on save.
+const RECHECK_REPORT_BYTES: usize = 1024 * 1024;
+/// Debounce. Each publish re-locates every note in the file.
+const PUBLISH_DELAY: Duration = Duration::from_millis(150);
 
 pub fn run() -> anyhow::Result<()> {
     let (conn, io) = Connection::stdio();
@@ -56,19 +58,37 @@ pub fn run() -> anyhow::Result<()> {
             },
         )),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(true.into()),
         execute_command_provider: Some(ExecuteCommandOptions {
-            commands: [CMD_ADD, CMD_STATUS, CMD_OPEN, CMD_DELETE, CMD_IMPORT]
-                .map(String::from)
-                .to_vec(),
+            commands: [
+                CMD_ADD, CMD_STATUS, CMD_OPEN, CMD_DELETE, CMD_IMPORT, CMD_ACCEPT,
+            ]
+            .map(String::from)
+            .to_vec(),
             ..Default::default()
         }),
         ..Default::default()
     };
-    let init = conn.initialize(serde_json::to_value(caps)?)?;
+    let init = match conn.initialize(serde_json::to_value(caps)?) {
+        Ok(init) => init,
+        Err(e) => {
+            // Give the writer thread a chance to flush what's queued (the
+            // `initialize` reply, for one).
+            drop(conn);
+            io.join()?;
+            return Err(e.into());
+        }
+    };
     let params: InitializeParams = serde_json::from_value(init)?;
     let mut server = Server::new(conn, workspace_root(&params));
+    server.refresh_hints = params
+        .capabilities
+        .workspace
+        .and_then(|w| w.inlay_hint)
+        .and_then(|i| i.refresh_support)
+        .unwrap_or(false);
     server.start();
     server.main_loop()?;
     drop(server);
@@ -87,7 +107,6 @@ fn workspace_root(params: &InitializeParams) -> Option<PathBuf> {
     uri_to_path(uri)
 }
 
-/// Characters to escape in the path part of a `file://` URI.
 const PATH: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -117,20 +136,82 @@ fn path_to_uri(path: &Path) -> Option<Uri> {
 
 struct Doc {
     uri: Uri,
-    /// Worktree-relative path, if the file is inside the project.
+    /// Worktree-relative. None outside the project
     rel: Option<String>,
     text: Rc<str>,
+    /// Cached, since sniffing reads the whole file. Reset on edit for small
+    /// files, on save for large ones
+    is_report: Cell<Option<bool>>,
 }
 
-/// One project file's notes, located against its current text.
+impl Doc {
+    /// `.sarif` always. `.json` only if it's really SARIF or brakeman, not
+    /// every `package.json`
+    fn is_report(&self) -> bool {
+        let Some(rel) = self.rel.as_deref() else {
+            return false;
+        };
+        if rel.ends_with(".sarif") {
+            return true;
+        }
+        if !rel.ends_with(".json") {
+            return false;
+        }
+        if let Some(known) = self.is_report.get() {
+            return known;
+        }
+        let known = import::is_report(&self.text);
+        self.is_report.set(Some(known));
+        known
+    }
+}
+
+/// `generation` bumps on every change so cached anchors can't outlive the
+/// notes they were computed for. Mutate only via [`Notes::edit`].
+#[derive(Default)]
+struct Notes {
+    list: Vec<Note>,
+    generation: u64,
+}
+
+impl Notes {
+    fn edit(&mut self) -> &mut Vec<Note> {
+        self.generation += 1;
+        &mut self.list
+    }
+}
+
+impl std::ops::Deref for Notes {
+    type Target = [Note];
+
+    fn deref(&self) -> &[Note] {
+        &self.list
+    }
+}
+
+/// Cached locate result for one (text, generation) pair. Locating is the
+/// slow bit and diagnostics, hover, hints, actions and `cmd-t` all need it.
+/// Holding the `Rc` keeps the address alive, so same pointer = same text.
+struct Anchored {
+    text: Rc<str>,
+    generation: u64,
+    notes: Rc<[(usize, Anchor)]>,
+}
+
 struct FileNotes<'a> {
     uri: Uri,
     text: Rc<str>,
     notes: Vec<(&'a Note, Anchor)>,
 }
 
-/// An unopened file's text (`None` if unreadable), with the size and mtime
-/// it was read at.
+type Stamp = Option<(u64, Option<SystemTime>)>;
+
+fn stamp(path: &Path) -> Stamp {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| (m.len(), m.modified().ok()))
+}
+
 struct DiskText {
     stamp: (u64, Option<SystemTime>),
     text: Option<Rc<str>>,
@@ -139,19 +220,28 @@ struct DiskText {
 struct Server {
     conn: Connection,
     store: Option<Store>,
-    /// The project root as Zed gave it. The store's root is canonical, but Zed
-    /// matches paths to its worktrees textually, so URIs we send use this one.
+    /// Root as Zed sent it, not canonicalized. Zed matches worktree paths
+    /// textually, so outgoing URIs have to use this spelling.
     client_root: Option<PathBuf>,
     config: Config,
-    /// Last config warning shown, so an invalid config is reported once.
     config_warning: Option<String>,
-    notes: Vec<Note>,
+    notes: Notes,
+    anchored: RefCell<HashMap<String, Anchored>>,
+    /// Last committer per note file. Shells out to git, so cached on stamp
+    committers: RefCell<HashMap<String, (Stamp, Option<String>)>>,
+    note_errors: Vec<LoadError>,
+    announced_errors: HashSet<String>,
     docs: HashMap<String, Doc>,
-    /// Texts of noted files that aren't open, so publishing and `cmd-t` don't
-    /// re-read them; a file is read again when its size or mtime changes.
+    /// Unopened files' text, keyed on stamp. Saves re-reading on every
+    /// publish / `cmd-t`
     disk: RefCell<HashMap<String, DiskText>>,
-    /// URIs that currently have diagnostics from us, so they can be cleared.
+    /// what we've published to, so it can be cleared later
     published: HashSet<String>,
+    refresh_hints: bool,
+    hints_stale: bool,
+    /// debounced publishes, see PUBLISH_DELAY
+    pending: BTreeSet<String>,
+    publish_due: Option<Instant>,
     next_request: u64,
 }
 
@@ -159,7 +249,6 @@ fn arg(args: &[Value], i: usize) -> anyhow::Result<&Value> {
     args.get(i).with_context(|| format!("missing argument {i}"))
 }
 
-/// A 1-based line number argument.
 fn arg_line(args: &[Value], i: usize) -> anyhow::Result<u32> {
     arg(args, i)?
         .as_u64()
@@ -182,17 +271,25 @@ impl Server {
             client_root: root,
             config: Config::default(),
             config_warning: None,
-            notes: Vec::new(),
+            notes: Notes::default(),
+            anchored: RefCell::default(),
+            committers: RefCell::default(),
+            note_errors: Vec::new(),
+            announced_errors: HashSet::new(),
             docs: HashMap::new(),
             disk: RefCell::default(),
             published: HashSet::new(),
+            refresh_hints: false,
+            hints_stale: false,
+            pending: BTreeSet::new(),
+            publish_due: None,
             next_request: 0,
         }
     }
 
     fn start(&mut self) {
         self.reload();
-        // Pick up edits to note files made outside the editor, or by git.
+        // Catch note files changed outside the editor (git checkout etc).
         self.send_request(
             "client/registerCapability",
             RegistrationParams {
@@ -214,11 +311,28 @@ impl Server {
     }
 
     fn main_loop(&mut self) -> anyhow::Result<()> {
-        while let Ok(msg) = self.conn.receiver.recv() {
+        loop {
+            let msg = match self.publish_due {
+                None => self.conn.receiver.recv().ok(),
+                Some(due) => match self
+                    .conn
+                    .receiver
+                    .recv_timeout(due.saturating_duration_since(Instant::now()))
+                {
+                    Ok(msg) => Some(msg),
+                    Err(e) if e.is_timeout() => {
+                        self.publish_pending();
+                        self.flush_hints();
+                        continue;
+                    }
+                    Err(_) => None,
+                },
+            };
+            let Some(msg) = msg else { break };
             match msg {
                 Message::Request(req) => {
-                    if self.conn.handle_shutdown(&req)? {
-                        return Ok(());
+                    if req.method == "shutdown" {
+                        return self.shut_down(req.id);
                     }
                     let id = req.id.clone();
                     let resp = match self.handle_request(req) {
@@ -242,6 +356,30 @@ impl Server {
                 }
                 Message::Response(_) => {}
             }
+            self.flush_hints();
+        }
+        Ok(())
+    }
+
+    /// Not `Connection::handle_shutdown`, which errors on anything but `exit`.
+    /// The reply to a request we sent just before (inlay hint refresh, say)
+    /// can land in between.
+    fn shut_down(&mut self, id: RequestId) -> anyhow::Result<()> {
+        self.conn
+            .sender
+            .send(Message::Response(Response::new_ok(id, Value::Null)))?;
+        while let Ok(msg) = self.conn.receiver.recv() {
+            match msg {
+                Message::Notification(n) if n.method == "exit" => return Ok(()),
+                Message::Request(req) => {
+                    self.conn.sender.send(Message::Response(Response::new_err(
+                        req.id,
+                        ErrorCode::InvalidRequest as i32,
+                        "the server is shutting down".into(),
+                    )))?;
+                }
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -251,6 +389,10 @@ impl Server {
             "textDocument/hover" => {
                 let p: HoverParams = serde_json::from_value(req.params)?;
                 serde_json::to_value(self.hover(&p))?
+            }
+            "textDocument/inlayHint" => {
+                let p: InlayHintParams = serde_json::from_value(req.params)?;
+                serde_json::to_value(self.inlay_hints(&p))?
             }
             "textDocument/codeAction" => {
                 let p: CodeActionParams = serde_json::from_value(req.params)?;
@@ -281,9 +423,10 @@ impl Server {
                         uri: p.text_document.uri,
                         rel,
                         text: p.text_document.text.into(),
+                        is_report: Cell::new(None),
                     },
                 );
-                self.doc_changed(&key);
+                self.doc_opened(&key);
             }
             "textDocument/didChange" => {
                 let p: DidChangeTextDocumentParams = serde_json::from_value(n.params)?;
@@ -293,11 +436,17 @@ impl Server {
                     p.content_changes.into_iter().last(),
                 ) {
                     doc.text = change.text.into();
+                    if doc.text.len() <= RECHECK_REPORT_BYTES {
+                        doc.is_report.set(None);
+                    }
                 }
                 self.doc_changed(&key);
             }
             "textDocument/didSave" => {
                 let p: DidSaveTextDocumentParams = serde_json::from_value(n.params)?;
+                if let Some(doc) = self.docs.get(p.text_document.uri.as_str()) {
+                    doc.is_report.set(None);
+                }
                 self.doc_saved(p.text_document.uri.as_str());
             }
             "textDocument/didClose" => {
@@ -306,7 +455,7 @@ impl Server {
                     .docs
                     .remove(p.text_document.uri.as_str())
                     .and_then(|d| d.rel);
-                // Unsaved edits are gone: fall back to what is on disk.
+                // Unsaved edits are lost; use what's on disk.
                 match rel.as_deref().and_then(Self::note_file_id) {
                     Some(id) => self.revert_note(id),
                     None => {
@@ -325,22 +474,19 @@ impl Server {
         Ok(())
     }
 
-    // ---- state ------------------------------------------------------------
-
     fn rel(&self, uri: &Uri) -> Option<String> {
         self.store.as_ref()?.relative(&uri_to_path(uri)?)
     }
 
-    /// The note id if `rel` is a note file, e.g. `.code-review-notes/7f3a9c21.md`.
+    /// e.g. `.code-review-notes/7f3a9c21.md` -> `7f3a9c21`
     fn note_file_id(rel: &str) -> Option<&str> {
         rel.strip_prefix(store::DIR)?
             .strip_prefix('/')?
             .strip_suffix(".md")
     }
 
-    /// Re-read every note from disk, then overlay note files open with unsaved
-    /// edits. Only notes still on disk are overlaid, so deleting a note whose
-    /// file is open in the editor does not bring it back.
+    /// Reload from disk, then overlay dirty note buffers. Only for notes still
+    /// on disk, otherwise deleting a note with its file open resurrects it.
     fn reload(&mut self) {
         let Some(store) = &self.store else { return };
         let (config, warning) = store.config();
@@ -351,26 +497,74 @@ impl Server {
             self.show_message(MessageType::WARNING, format!("{NAME}: {w}"));
         }
         self.config_warning = warning;
-        let (mut notes, errors) = store.load_all();
-        for e in errors {
-            eprintln!("code-review-notes: skipped note {e}");
-        }
+        let (mut notes, mut errors) = store.load_all();
         for doc in self.docs.values() {
-            if let Some(id) = doc.rel.as_deref().and_then(Self::note_file_id)
-                && let Ok(live) = Note::parse(&doc.text)
-                && live.meta.id == id
-                && let Some(slot) = notes.iter_mut().find(|n| n.meta.id == id)
-            {
+            let Some(id) = doc.rel.as_deref().and_then(Self::note_file_id) else {
+                continue;
+            };
+            let Ok(live) = Note::parse(&doc.text) else {
+                continue;
+            };
+            if live.meta.id != id {
+                continue;
+            }
+            if let Some(slot) = notes.iter_mut().find(|n| n.meta.id == id) {
                 *slot = live;
+            } else if let Some(i) = errors.iter().position(|e| is_error_for(e, id)) {
+                // saved broken, being fixed in the editor
+                errors.remove(i);
+                notes.push(live);
             }
         }
-        self.notes = notes;
+        self.announce_errors(&errors);
+        self.note_errors = errors;
+        *self.notes.edit() = notes;
         self.publish_all();
     }
 
-    /// A note file's buffer changed: use its text in place of the saved note,
-    /// if it parses as that note, and republish just the files involved.
-    /// A buffer mid-edit that doesn't parse leaves the last good version.
+    /// Announce unreadable note files once each instead of silently dropping
+    /// those notes.
+    fn announce_errors(&mut self, errors: &[LoadError]) {
+        let keys: HashSet<String> = errors.iter().map(ToString::to_string).collect();
+        let new: Vec<&LoadError> = errors
+            .iter()
+            .filter(|e| !self.announced_errors.contains(&e.to_string()))
+            .collect();
+        for e in &new {
+            eprintln!("code-review-notes: skipped note {e}");
+        }
+        // Full error (often multi-line) goes on the file's diagnostic.
+        let message = match new.as_slice() {
+            [] => None,
+            [
+                LoadError {
+                    path: Some(path), ..
+                },
+            ] => Some(format!(
+                "{NAME}: note {} can't be read, so it isn't shown; the diagnostics panel says why",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            [
+                LoadError {
+                    path: None,
+                    message,
+                },
+            ] => Some(format!("{NAME}: notes can't be read: {message}")),
+            many => Some(format!(
+                "{NAME}: {} notes can't be read, so they aren't shown; the diagnostics panel says why",
+                many.len()
+            )),
+        };
+        if let Some(m) = message {
+            self.show_message(MessageType::WARNING, m);
+        }
+        // Forget fixed errors so one that comes back gets announced again.
+        self.announced_errors = keys;
+    }
+
+    /// Note file buffer changed. If it parses as that note, it replaces the
+    /// saved version and only the affected files are republished. Half-typed
+    /// garbage keeps the last good version.
     fn note_buffer_changed(&mut self, key: &str) {
         let Some(doc) = self.docs.get(key) else {
             return;
@@ -381,40 +575,45 @@ impl Server {
         let Ok(live) = Note::parse(&doc.text) else {
             return;
         };
-        // Only notes still on disk are shown, so deleting a note whose file is
-        // open in the editor does not bring it back.
-        let Some(slot) = self.notes.iter_mut().find(|n| n.meta.id == id) else {
+        if live.meta.id != id {
+            return;
+        }
+        // Same rule as `reload`: only notes still on disk. One saved broken
+        // counts, so fixing it in the buffer brings it back and clears its error.
+        let Some(i) = self.notes.iter().position(|n| n.meta.id == id) else {
+            if let Some(i) = self.note_errors.iter().position(|e| is_error_for(e, id)) {
+                self.note_errors.remove(i);
+                self.notes.edit().push(live);
+                self.publish_all();
+            }
             return;
         };
-        if live.meta.id != id || *slot == live {
+        if self.notes[i] == live {
             return;
         }
-        let old = std::mem::replace(slot, live).meta.file;
-        let new = slot.meta.file.clone();
-        self.publish_file(&old);
-        if new != old {
-            self.publish_file(&new);
-        }
+        let new = live.meta.file.clone();
+        let old = std::mem::replace(&mut self.notes.edit()[i], live).meta.file;
+        // Hover/hints see the new text right away; diagnostics wait for typing to stop.
+        self.refresh_inlay_hints();
+        self.schedule_publish(old);
+        self.schedule_publish(new);
     }
 
-    /// Show the saved version of a note again, e.g. after its file is closed
-    /// without saving.
+    /// Back to the saved version, e.g. buffer closed without saving.
     fn revert_note(&mut self, id: &str) {
         let Some(store) = &self.store else { return };
-        let saved = store.load(id).ok();
-        let i = self.notes.iter().position(|n| n.meta.id == id);
-        let mut files = Vec::new();
-        match (i, saved) {
-            (Some(i), Some(note)) => {
-                files.push(note.meta.file.clone());
-                files.push(std::mem::replace(&mut self.notes[i], note).meta.file);
+        let Some(saved) = store.load(id).ok() else {
+            // If it was deleted or saved broken, reload drops it or brings the
+            // error back.
+            return self.reload();
+        };
+        let mut files = vec![saved.meta.file.clone()];
+        match self.notes.iter().position(|n| n.meta.id == id) {
+            Some(i) => {
+                let old = std::mem::replace(&mut self.notes.edit()[i], saved);
+                files.push(old.meta.file);
             }
-            (Some(i), None) => files.push(self.notes.remove(i).meta.file),
-            (None, Some(note)) => {
-                files.push(note.meta.file.clone());
-                self.notes.push(note);
-            }
-            (None, None) => {}
+            None => self.notes.edit().push(saved),
         }
         files.dedup();
         for f in files {
@@ -422,21 +621,34 @@ impl Server {
         }
     }
 
-    fn doc_changed(&mut self, key: &str) {
-        let is_note = self
-            .docs
-            .get(key)
-            .and_then(|d| d.rel.as_deref())
-            .and_then(Self::note_file_id)
-            .is_some();
-        if is_note {
+    fn doc_opened(&mut self, key: &str) {
+        if self.is_note_doc(key) {
             self.note_buffer_changed(key);
         } else {
             self.publish(key);
         }
     }
 
-    /// On save, write moved anchors back so the note files follow the code.
+    fn doc_changed(&mut self, key: &str) {
+        if self.is_note_doc(key) {
+            self.note_buffer_changed(key);
+        } else if let Some(rel) = self.docs.get(key).and_then(|d| d.rel.clone()) {
+            self.schedule_publish(rel);
+        }
+    }
+
+    fn is_note_doc(&self, key: &str) -> bool {
+        self.docs
+            .get(key)
+            .and_then(|d| d.rel.as_deref())
+            .and_then(Self::note_file_id)
+            .is_some()
+    }
+
+    /// On save, write moved anchors back so note files follow the code, and
+    /// backfill neighbour lines for older notes.
+    /// Edited code gets new lines but keeps the old snippet. That's what was
+    /// reviewed, and diffing against it keeps the note flagged as changed.
     fn doc_saved(&mut self, key: &str) {
         let Some(doc) = self.docs.get(key) else {
             return;
@@ -447,15 +659,32 @@ impl Server {
             return;
         }
         let moved: Vec<Note> = self
-            .notes
-            .iter()
-            .filter(|n| n.meta.file == rel)
-            .filter_map(|n| match locate(n, &doc.text) {
+            .notes_in(doc)
+            .filter_map(|(n, a)| match a {
                 Anchor::Moved { start, end } => {
+                    let mut n = n.clone();
+                    n.meta.set(start, anchor::code_at(&doc.text, start, end)?);
+                    Some(n)
+                }
+                // Older notes predate neighbour lines. Record them while the code is
+                // still intact, they're what lets the note track edits later.
+                Anchor::Exact { start, end }
+                    if n.meta.context_before.is_none() && n.meta.context_after.is_none() =>
+                {
+                    let (before, after) = anchor::context(&doc.text, start, end);
+                    if before.is_none() && after.is_none() {
+                        return None;
+                    }
+                    let mut n = n.clone();
+                    (n.meta.context_before, n.meta.context_after) = (before, after);
+                    Some(n)
+                }
+                Anchor::Changed { start, end }
+                    if (start, end) != (n.meta.start_line, n.meta.end_line) =>
+                {
                     let mut n = n.clone();
                     n.meta.start_line = start;
                     n.meta.end_line = end;
-                    n.meta.snippet = anchor::extract(&doc.text, start, end);
                     Some(n)
                 }
                 _ => None,
@@ -473,10 +702,9 @@ impl Server {
         }
     }
 
-    /// Persist a changed note and keep it in memory. If the note's file is
-    /// open with unsaved edits, change the editor's buffer instead and leave
-    /// saving to the user: writing to disk behind a dirty buffer makes Zed
-    /// flag a conflict, and one side's edits get lost.
+    /// Persist a changed note. If its file is open and dirty, edit the buffer
+    /// instead and leave saving to the user. Writing behind a dirty buffer
+    /// makes Zed flag a conflict and someone's edits get lost.
     fn write_note(&mut self, note: Note) -> anyhow::Result<()> {
         let store = self.store.as_ref().context("no project folder is open")?;
         let id = note.meta.id.clone();
@@ -487,8 +715,8 @@ impl Server {
             .find(|d| d.rel.as_deref().and_then(Self::note_file_id) == Some(id.as_str()));
         match open {
             Some(doc) if !matches_disk(&path, &doc.text) => {
-                // `reload` already merged the buffer into the note, unless the
-                // buffer doesn't parse (mid-edit) or names another note.
+                // `reload` already merged the buffer in, unless it doesn't parse yet or
+                // names a different note.
                 anyhow::ensure!(
                     Note::parse(&doc.text).is_ok_and(|live| live.meta.id == id),
                     "note {id} has unsaved edits that can't be read; save or fix it first"
@@ -512,39 +740,91 @@ impl Server {
                     .with_context(|| format!("saving note {id}"))?;
             }
         }
-        if let Some(slot) = self.notes.iter_mut().find(|n| n.meta.id == id) {
-            *slot = note;
+        if let Some(i) = self.notes.iter().position(|n| n.meta.id == id) {
+            self.notes.edit()[i] = note;
         }
         Ok(())
     }
 
-    fn notes_in<'a>(&'a self, doc: &'a Doc) -> impl Iterator<Item = (&'a Note, Anchor)> + 'a {
-        let rel = doc.rel.as_deref();
-        self.notes
-            .iter()
-            .filter(move |n| Some(n.meta.file.as_str()) == rel)
-            .map(|n| (n, locate(n, &doc.text)))
+    /// Re-anchor to the current code if it was edited. The snippet becomes the
+    /// current code, so it stops showing as changed. Also backfills context.
+    fn with_current_code(&self, note: &Note) -> Note {
+        let mut out = note.clone();
+        let Some(FileNotes { text, notes, .. }) = self.file_notes(&note.meta.file) else {
+            return out;
+        };
+        match notes.iter().find(|(n, _)| n.meta.id == note.meta.id) {
+            Some(&(_, Anchor::Changed { start, end })) => {
+                if let Some(code) = anchor::code_at(&text, start, end) {
+                    out.meta.set(start, code);
+                }
+            }
+            Some(&(_, Anchor::Exact { start, end }))
+                if note.meta.context_before.is_none() && note.meta.context_after.is_none() =>
+            {
+                (out.meta.context_before, out.meta.context_after) =
+                    anchor::context(&text, start, end);
+            }
+            _ => {}
+        }
+        out
     }
 
-    /// Every note with its file's URI, current text and anchor, grouped by
-    /// file. Open files use the editor's text; others are read from disk.
-    fn located(&self) -> Vec<FileNotes<'_>> {
-        let mut by_file: BTreeMap<&str, Vec<&Note>> = BTreeMap::new();
-        for n in &self.notes {
-            by_file.entry(n.meta.file.as_str()).or_default().push(n);
+    fn notes_in<'a>(&'a self, doc: &Doc) -> impl Iterator<Item = (&'a Note, Anchor)> + 'a {
+        let anchors = match doc.rel.as_deref() {
+            Some(rel) => self.anchors(rel, &doc.text),
+            None => Rc::from([]),
+        };
+        (0..anchors.len()).map(move |k| {
+            let (i, a) = anchors[k];
+            (&self.notes[i], a)
+        })
+    }
+
+    /// Cached per text + generation.
+    fn anchors(&self, rel: &str, text: &Rc<str>) -> Rc<[(usize, Anchor)]> {
+        let generation = self.notes.generation;
+        if let Some(a) = self.anchored.borrow().get(rel)
+            && a.generation == generation
+            && Rc::ptr_eq(&a.text, text)
+        {
+            return a.notes.clone();
         }
+        let notes: Rc<[(usize, Anchor)]> = self
+            .notes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.meta.file == rel)
+            .map(|(i, n)| (i, locate(n, text)))
+            .collect();
+        self.anchored.borrow_mut().insert(
+            rel.to_string(),
+            Anchored {
+                text: text.clone(),
+                generation,
+                notes: notes.clone(),
+            },
+        );
+        notes
+    }
+
+    /// All notes grouped by file, with URI, text and anchor. Open files use the
+    /// buffer, others disk.
+    fn located(&self) -> Vec<FileNotes<'_>> {
+        let files: BTreeSet<&str> = self.notes.iter().map(|n| n.meta.file.as_str()).collect();
         self.disk
             .borrow_mut()
-            .retain(|rel, _| by_file.contains_key(rel.as_str()));
-        by_file
+            .retain(|rel, _| files.contains(rel.as_str()));
+        self.anchored
+            .borrow_mut()
+            .retain(|rel, _| files.contains(rel.as_str()));
+        files
             .into_iter()
-            .filter_map(|(rel, notes)| self.file_notes(rel, notes))
+            .filter_map(|rel| self.file_notes(rel))
             .collect()
     }
 
-    /// One file's notes, located against the editor's text if the file is
-    /// open, else against what is on disk.
-    fn file_notes<'a>(&'a self, rel: &str, notes: Vec<&'a Note>) -> Option<FileNotes<'a>> {
+    fn file_notes(&self, rel: &str) -> Option<FileNotes<'_>> {
         let (uri, text) = match self.docs.values().find(|d| d.rel.as_deref() == Some(rel)) {
             Some(doc) => (doc.uri.clone(), Some(doc.text.clone())),
             None => {
@@ -553,19 +833,22 @@ impl Server {
                 (self.client_uri(&path)?, self.disk_text(rel, &path))
             }
         };
-        let notes = notes
-            .into_iter()
-            .map(|n| match &text {
-                Some(t) => (n, locate(n, t)),
-                None => (
-                    n,
-                    Anchor::Stale {
-                        start: n.meta.start_line,
-                        end: n.meta.end_line,
-                    },
-                ),
-            })
-            .collect();
+        let notes = match &text {
+            Some(t) => self
+                .anchors(rel, t)
+                .iter()
+                .map(|&(i, a)| (&self.notes[i], a))
+                .collect(),
+            None => self
+                .notes
+                .iter()
+                .filter(|n| n.meta.file == rel)
+                .map(|n| {
+                    let (start, end) = (n.meta.start_line, n.meta.end_line);
+                    (n, Anchor::Stale { start, end })
+                })
+                .collect(),
+        };
         Some(FileNotes {
             uri,
             text: text.unwrap_or_else(|| "".into()),
@@ -573,8 +856,6 @@ impl Server {
         })
     }
 
-    /// An unopened file's text, from the cache while its size and mtime are
-    /// unchanged.
     fn disk_text(&self, rel: &str, path: &Path) -> Option<Rc<str>> {
         let mut cache = self.disk.borrow_mut();
         let Ok(meta) = std::fs::metadata(path) else {
@@ -600,10 +881,12 @@ impl Server {
         text
     }
 
-    /// Publish diagnostics for every file with notes, open or not, so Zed's
-    /// project diagnostics panel lists every note. Files that no longer have
-    /// notes are cleared.
+    /// Every noted file, open or not, so the project diagnostics panel lists
+    /// all notes. Files that lost their last note get cleared.
     fn publish_all(&mut self) {
+        self.refresh_inlay_hints();
+        self.pending.clear();
+        self.publish_due = None;
         let mut out: HashMap<String, (Uri, Vec<Diagnostic>)> = self
             .located()
             .into_iter()
@@ -615,6 +898,14 @@ impl Server {
                 (uri.as_str().to_string(), (uri, diags))
             })
             .collect();
+        for e in &self.note_errors {
+            if let Some(uri) = e.path.as_deref().and_then(|p| self.client_uri(p)) {
+                out.entry(uri.as_str().to_string())
+                    .or_insert_with(|| (uri, Vec::new()))
+                    .1
+                    .push(load_error_diagnostic(e));
+            }
+        }
         for doc in self.docs.values() {
             out.entry(doc.uri.as_str().to_string())
                 .or_insert_with(|| (doc.uri.clone(), Vec::new()));
@@ -634,18 +925,49 @@ impl Server {
         }
     }
 
-    /// Republish one file, open or not, after its notes changed.
-    fn publish_file(&mut self, rel: &str) {
-        if let Some(key) = self
-            .docs
+    /// Zed re-requests hints by itself after an edit, but not when notes change
+    /// some other way. Batched: [`Server::flush_hints`] sends it once per message.
+    fn refresh_inlay_hints(&mut self) {
+        self.hints_stale = true;
+    }
+
+    fn flush_hints(&mut self) {
+        if std::mem::take(&mut self.hints_stale) && self.refresh_hints {
+            self.send_request("workspace/inlayHint/refresh", ());
+        }
+    }
+
+    fn schedule_publish(&mut self, rel: String) {
+        self.pending.insert(rel);
+        self.publish_due = Some(Instant::now() + PUBLISH_DELAY);
+    }
+
+    /// No hint refresh here. Open files got one when their notes changed, and
+    /// Zed re-asks after edits anyway.
+    fn publish_pending(&mut self) {
+        self.publish_due = None;
+        for rel in std::mem::take(&mut self.pending) {
+            match self.doc_key(&rel) {
+                Some(key) => self.publish(&key),
+                None => self.publish_file(&rel),
+            }
+        }
+    }
+
+    fn doc_key(&self, rel: &str) -> Option<String> {
+        self.docs
             .iter()
             .find(|(_, d)| d.rel.as_deref() == Some(rel))
             .map(|(k, _)| k.clone())
-        {
+    }
+
+    fn publish_file(&mut self, rel: &str) {
+        self.refresh_inlay_hints();
+        if let Some(key) = self.doc_key(rel) {
             return self.publish(&key);
         }
-        let notes = self.notes.iter().filter(|n| n.meta.file == rel).collect();
-        let Some(FileNotes { uri, text, notes }) = self.file_notes(rel, notes) else {
+        self.pending.remove(rel);
+        let Some(FileNotes { uri, text, notes }) = self.file_notes(rel) else {
             return;
         };
         let diagnostics: Vec<Diagnostic> = notes
@@ -661,11 +983,13 @@ impl Server {
         self.send_diagnostics(uri, diagnostics);
     }
 
-    /// Republish one open file after an edit.
     fn publish(&mut self, key: &str) {
         let Some(doc) = self.docs.get(key) else {
             return;
         };
+        if let Some(rel) = &doc.rel {
+            self.pending.remove(rel);
+        }
         let diagnostics: Vec<Diagnostic> = self
             .notes_in(doc)
             .map(|(n, a)| diagnostic(n, a, &doc.text, &self.config))
@@ -688,21 +1012,21 @@ impl Server {
         self.notify("textDocument/publishDiagnostics", params);
     }
 
-    /// Project symbol search (`cmd-t`): one symbol per note, named
-    /// `[Status] title`. Zed fuzzy-filters too; matching here keeps large
-    /// projects from sending every note on every keystroke.
+    /// `cmd-t`, one symbol per note named `[Status] title`. Zed fuzzy-filters
+    /// too, but filtering here avoids shipping every note per keystroke.
     #[allow(deprecated)] // SymbolInformation::deprecated
     fn symbols(&self, query: &str) -> Vec<SymbolInformation> {
         let mut out = Vec::new();
         for FileNotes { uri, text, notes } in self.located() {
             for (n, a) in notes {
-                let stale = if a.is_stale() { " (stale)" } else { "" };
+                let tags: String = n.meta.tags.iter().map(|t| format!(" #{t}")).collect();
                 let name = format!(
-                    "[{}] {}{stale}",
+                    "[{}] {}{tags}{}",
                     self.config.label(&n.meta.status),
-                    n.plain_title()
+                    n.plain_title(),
+                    anchor_suffix(a, " (stale)", " (changed)")
                 );
-                // Zed filters again on the name alone, so match only that.
+                // Zed re-filters on the name only, so match just that.
                 if !fuzzy_match(query, &name) {
                     continue;
                 }
@@ -722,17 +1046,24 @@ impl Server {
         out
     }
 
-    // ---- requests ---------------------------------------------------------
-
     fn hover(&self, p: &HoverParams) -> Option<Hover> {
         let doc = self
             .docs
             .get(p.text_document_position_params.text_document.uri.as_str())?;
         let line = p.text_document_position_params.position.line + 1;
+        let store = self.store.as_ref()?;
+        let author = store.author();
+        let me: Vec<&str> = std::iter::once(author.as_str())
+            .chain(store.git_user())
+            .collect();
         let parts: Vec<String> = self
             .notes_in(doc)
             .filter(|(_, a)| (a.range().0..=a.range().1).contains(&line))
-            .map(|(n, a)| hover_text(n, a, &self.config))
+            .map(|(n, a)| {
+                let committer = self.committer(store, &n.meta.id);
+                let by = provenance(n, &me, committer.as_deref());
+                hover_text(n, a, &self.config, &by)
+            })
             .collect();
         (!parts.is_empty()).then(|| Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -741,6 +1072,50 @@ impl Server {
             }),
             range: None,
         })
+    }
+
+    fn committer(&self, store: &Store, id: &str) -> Option<String> {
+        let stamp = stamp(&store.note_path(id));
+        let mut cache = self.committers.borrow_mut();
+        if let Some((s, c)) = cache.get(id)
+            && *s == stamp
+        {
+            return c.clone();
+        }
+        let c = store.last_committer(id);
+        cache.insert(id.to_string(), (stamp, c.clone()));
+        c
+    }
+
+    /// Hint at the end of each note's first line, so notes below warning
+    /// severity are still visible (when inlay hints are on).
+    fn inlay_hints(&self, p: &InlayHintParams) -> Vec<InlayHint> {
+        let Some(doc) = self.docs.get(p.text_document.uri.as_str()) else {
+            return Vec::new();
+        };
+        let lines: Vec<&str> = doc.text.lines().collect();
+        let mut hints: Vec<InlayHint> = self
+            .notes_in(doc)
+            .filter_map(|(n, a)| {
+                let line = a.range().0.checked_sub(1)?;
+                if line < p.range.start.line || line > p.range.end.line {
+                    return None;
+                }
+                let end = lines.get(line as usize)?.encode_utf16().count() as u32;
+                Some(InlayHint {
+                    position: Position::new(line, end),
+                    label: InlayHintLabel::String(hint_label(n, a, &self.config)),
+                    kind: None,
+                    text_edits: None,
+                    tooltip: None,
+                    padding_left: Some(true),
+                    padding_right: None,
+                    data: None,
+                })
+            })
+            .collect();
+        hints.sort_by_key(|h| (h.position.line, h.position.character));
+        hints
     }
 
     fn code_actions(&self, p: &CodeActionParams) -> Vec<CodeActionOrCommand> {
@@ -752,7 +1127,7 @@ impl Server {
             return out;
         };
 
-        // Inside a note file: change that note's status.
+        // In a note file: change its status
         if let Some(id) = Self::note_file_id(rel) {
             if let Some(note) = self.notes.iter().find(|n| n.meta.id == id) {
                 out.extend(status_actions(note, &self.config, false));
@@ -760,8 +1135,8 @@ impl Server {
             return out;
         }
 
-        // An open scanner report.
-        if rel.ends_with(".sarif") || rel.ends_with(".json") {
+        // open scanner report
+        if doc.is_report() {
             out.push(action(
                 "Import into Code Review Notes",
                 Some(CodeActionKind::SOURCE),
@@ -771,14 +1146,21 @@ impl Server {
         }
 
         let (start, end) = selected_lines(p.range);
-        let here: Vec<&Note> = self
+        let here: Vec<(&Note, Anchor)> = self
             .notes_in(doc)
             .filter(|(_, a)| a.range().0 <= end && start <= a.range().1)
-            .map(|(n, _)| n)
             .collect();
         let several = here.len() > 1;
-        for note in &here {
+        for (note, anchor) in &here {
             out.extend(status_actions(note, &self.config, several));
+            if anchor.is_changed() {
+                out.push(action(
+                    &suffixed("Accept edited code", note, several),
+                    Some(CodeActionKind::QUICKFIX),
+                    CMD_ACCEPT,
+                    vec![json!(note.meta.id)],
+                ));
+            }
             out.push(action(
                 &suffixed("Open review note", note, several),
                 None,
@@ -811,33 +1193,28 @@ impl Server {
                 anyhow::ensure!(start <= end, "start line {start} is after end line {end}");
                 let doc = self.docs.get(key).context("document is not open")?;
                 let rel = doc.rel.clone().context("file is outside the project")?;
-                let snippet = anchor::extract(&doc.text, start, end);
-                anyhow::ensure!(
-                    !snippet.is_empty(),
-                    "line {start} is past the end of the file"
-                );
-                let end = start + snippet.lines().count().max(1) as u32 - 1;
-                let note = Note {
-                    meta: Meta {
-                        id: store.new_id(&format!("{rel}:{start}")),
-                        file: rel,
-                        start_line: start,
-                        end_line: end,
-                        status: self.config.new_note_status().to_string(),
-                        author: store.author(),
-                        created: Utc::now().trunc_subsecs(0),
-                        source: None,
-                        rule: None,
-                        fingerprint: None,
-                        snippet,
-                    },
-                    body: "# New review note\n\nWrite your note here. The first line is the title."
-                        .into(),
-                };
+                let note = Note::new_on(
+                    store.new_id(&format!("{rel}:{start}")),
+                    rel,
+                    &doc.text,
+                    start,
+                    end,
+                    self.config.new_note_status(),
+                    store.author(),
+                    format!(
+                        "# {PLACEHOLDER_TITLE}\n\nWrite your note here. The first line is the title."
+                    ),
+                )?;
+                let title = note.title_position();
                 let path = store.save(&note)?;
-                self.notes.push(note);
+                self.notes.edit().push(note);
                 self.publish_all();
-                self.show_document(&path);
+                // With the placeholder title selected, typing replaces it.
+                let selection = title.map(|(line, start, end)| Range {
+                    start: Position::new(line, start),
+                    end: Position::new(line, end),
+                });
+                self.show_document(&path, selection);
             }
             CMD_STATUS => {
                 let id = arg_str(args, 0)?;
@@ -849,22 +1226,37 @@ impl Server {
                     .label
                     .clone();
                 let author = store.author();
-                let mut note = self
+                let note = self
                     .notes
                     .iter()
                     .find(|n| n.meta.id == id)
-                    .context("note not found")?
-                    .clone();
+                    .context("note not found")?;
                 if note.meta.status != status {
-                    note.meta.status = status.to_string();
-                    note.body.push_str(&format!(
-                        "\n\n_{} marked this {} on {}._",
-                        md_escape(&author),
-                        md_escape(&label),
-                        Utc::now().format("%Y-%m-%d")
-                    ));
+                    // Marking a note on edited code counts as reviewing it again.
+                    let mut note = self.with_current_code(note);
+                    note.mark(status, &label, &author);
                     self.write_note(note)?;
                 }
+                self.publish_all();
+            }
+            CMD_ACCEPT => {
+                let id = arg_str(args, 0)?;
+                let author = store.author();
+                let note = self
+                    .notes
+                    .iter()
+                    .find(|n| n.meta.id == id)
+                    .context("note not found")?;
+                // The menu may be stale if the code was undone or the note deleted since.
+                let changed = self.file_notes(&note.meta.file).is_some_and(|f| {
+                    f.notes
+                        .iter()
+                        .any(|(n, a)| n.meta.id == id && a.is_changed())
+                });
+                anyhow::ensure!(changed, "the note's code is no longer marked changed");
+                let mut note = self.with_current_code(note);
+                note.history(&format!("{} accepted the edited code", md_escape(&author)));
+                self.write_note(note)?;
                 self.publish_all();
             }
             CMD_OPEN => {
@@ -875,7 +1267,7 @@ impl Server {
                     .find(|n| n.meta.id == id)
                     .context("note not found")?;
                 let path = store.note_path(&note.meta.id);
-                self.show_document(&path);
+                self.show_document(&path, None);
             }
             CMD_DELETE => {
                 let id = arg_str(args, 0)?;
@@ -885,7 +1277,7 @@ impl Server {
                     .find(|n| n.meta.id == id)
                     .context("note not found")?;
                 store.delete(&note.meta.id)?;
-                self.notes.retain(|n| n.meta.id != id);
+                self.notes.edit().retain(|n| n.meta.id != id);
                 self.publish_all();
             }
             CMD_IMPORT => {
@@ -907,8 +1299,6 @@ impl Server {
         }
         Ok(())
     }
-
-    // ---- outgoing ---------------------------------------------------------
 
     fn notify(&self, method: &str, params: impl serde::Serialize) {
         let _ = self
@@ -944,7 +1334,7 @@ impl Server {
         path_to_uri(path)
     }
 
-    fn show_document(&mut self, path: &Path) {
+    fn show_document(&mut self, path: &Path, selection: Option<Range>) {
         if let Some(uri) = self.client_uri(path) {
             self.send_request(
                 "window/showDocument",
@@ -952,19 +1342,18 @@ impl Server {
                     uri,
                     external: Some(false),
                     take_focus: Some(true),
-                    selection: None,
+                    selection,
                 },
             );
         }
     }
 }
 
-/// Whether `text` is what is saved at `path` (Zed sends `\n` line endings).
+/// Does `text` match what's saved at `path`? Zed sends `\n` endings.
 fn matches_disk(path: &Path, text: &str) -> bool {
     std::fs::read_to_string(path).is_ok_and(|disk| disk.replace("\r\n", "\n") == text)
 }
 
-/// The range covering all of `text`.
 fn whole_document(text: &str) -> Range {
     let last = text.rsplit('\n').next().unwrap_or("");
     Range {
@@ -977,16 +1366,17 @@ fn whole_document(text: &str) -> Range {
 }
 
 fn locate(note: &Note, text: &str) -> Anchor {
-    anchor::locate(
+    anchor::locate_in(
         &note.meta.snippet,
+        note.meta.context(),
         note.meta.start_line,
         note.meta.end_line,
         text,
     )
 }
 
-/// 1-based inclusive lines covered by an LSP range; a selection ending at
-/// column 0 does not include that last line.
+/// 1-based, inclusive. A selection ending at column 0 doesn't count that
+/// last line.
 fn selected_lines(r: Range) -> (u32, u32) {
     let start = r.start.line + 1;
     let mut end = r.end.line + 1;
@@ -1005,7 +1395,7 @@ fn severity(s: Severity) -> DiagnosticSeverity {
     }
 }
 
-/// Case-insensitive subsequence match, like Zed's own fuzzy filtering.
+/// Case-insensitive subsequence match, roughly what Zed's fuzzy filter does.
 fn fuzzy_match(query: &str, haystack: &str) -> bool {
     let mut hay = haystack.chars().flat_map(char::to_lowercase);
     query
@@ -1015,7 +1405,6 @@ fn fuzzy_match(query: &str, haystack: &str) -> bool {
         .all(|q| hay.any(|h| h == q))
 }
 
-/// The whole lines a note covers, as an LSP range.
 fn note_range(anchor: Anchor, text: &str) -> Range {
     let (start, end) = anchor.range();
     let last = text
@@ -1035,18 +1424,18 @@ fn note_range(anchor: Anchor, text: &str) -> Range {
 }
 
 fn diagnostic(note: &Note, anchor: Anchor, text: &str, config: &Config) -> Diagnostic {
-    let stale = if anchor.is_stale() {
-        " (stale: the noted code has changed)"
-    } else {
-        ""
-    };
+    let suffix = anchor_suffix(
+        anchor,
+        " (stale: the noted code is gone)",
+        " (the noted code has changed)",
+    );
     Diagnostic {
         range: note_range(anchor, text),
         severity: Some(severity(config.severity(&note.meta.status))),
         code: Some(NumberOrString::String(note.meta.id.clone())),
         source: Some("code-review-notes".into()),
         message: format!(
-            "[{}] {}{stale}",
+            "[{}] {}{suffix}",
             config.label(&note.meta.status),
             note.plain_title()
         ),
@@ -1054,13 +1443,75 @@ fn diagnostic(note: &Note, anchor: Anchor, text: &str, config: &Config) -> Diagn
     }
 }
 
-fn hover_text(note: &Note, anchor: Anchor, config: &Config) -> String {
+/// `◆ [Status] title`, shortened to fit at the end of a line.
+fn hint_label(note: &Note, anchor: Anchor, config: &Config) -> String {
+    const MAX: usize = 60;
+    let full = format!(
+        "◆ [{}] {}{}",
+        config.label(&note.meta.status),
+        note.plain_title(),
+        anchor_suffix(anchor, " (stale)", " (changed)")
+    );
+    if full.chars().count() <= MAX {
+        return full;
+    }
+    let mut short: String = full.chars().take(MAX - 1).collect();
+    short.push('…');
+    short
+}
+
+fn anchor_suffix(anchor: Anchor, stale: &'static str, changed: &'static str) -> &'static str {
+    match anchor {
+        Anchor::Stale { .. } => stale,
+        Anchor::Changed { .. } => changed,
+        _ => "",
+    }
+}
+
+fn is_error_for(e: &LoadError, id: &str) -> bool {
+    e.path
+        .as_deref()
+        .and_then(Path::file_stem)
+        .is_some_and(|stem| *stem == *id)
+}
+
+fn load_error_diagnostic(e: &LoadError) -> Diagnostic {
+    Diagnostic {
+        range: Range::default(),
+        severity: Some(DiagnosticSeverity::ERROR),
+        source: Some("code-review-notes".into()),
+        message: format!("This note can't be read, so it isn't shown: {}", e.message),
+        ..Default::default()
+    }
+}
+
+/// Authorship bit of the hover. Flags notes you didn't write (except scanner
+/// findings, which show their rule) and the last committer if not you.
+/// `author` is only what the file claims, and a repo can ship its own notes.
+fn provenance(note: &Note, me: &[&str], committer: Option<&str>) -> String {
+    let mine = |name: &str| {
+        me.iter()
+            .any(|m| name == *m || name.strip_suffix(" (agent)") == Some(m))
+    };
+    let mut out = String::new();
+    if note.meta.source.is_none() && !mine(&note.meta.author) {
+        out.push_str(" · not written by you");
+    }
+    if let Some(c) = committer.filter(|c| !mine(c)) {
+        out.push_str(&format!(" · last committed by {}", md_escape(c)));
+    }
+    out
+}
+
+/// Hover markdown. Links get flattened to text because Zed follows hover
+/// links on click without asking.
+fn hover_text(note: &Note, anchor: Anchor, config: &Config, provenance: &str) -> String {
     let m = &note.meta;
-    let stale = if anchor.is_stale() { " · stale" } else { "" };
+    let state = anchor_suffix(anchor, " · stale", " · code changed since this note");
     let mut s = format!(
-        "**Review note · {}**{stale}\n\n{}\n\n",
+        "**Review note · {}**{state}{provenance}\n\n{}\n\n",
         md_escape(config.label(&m.status)),
-        note.body.trim()
+        defuse_links(note.body.trim())
     );
     let mut footer = vec![
         md_escape(&m.author),
@@ -1068,6 +1519,9 @@ fn hover_text(note: &Note, anchor: Anchor, config: &Config) -> String {
     ];
     if let Some(rule) = &m.rule {
         footer.push(format!("rule {}", inline_code(rule)));
+    }
+    if !m.tags.is_empty() {
+        footer.push(format!("tags {}", md_escape(&m.tags.join(", "))));
     }
     footer.push(inline_code(&m.id));
     s.push_str(&footer.join(" · "));
@@ -1161,6 +1615,144 @@ mod tests {
         assert_eq!(whole_document("").end, Position::new(0, 0));
         assert_eq!(whole_document("a\nbé\n").end, Position::new(2, 0));
         assert_eq!(whole_document("a\n😀x").end, Position::new(1, 3));
+    }
+
+    #[test]
+    fn anchors_are_cached_per_text_and_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, _client) = Connection::memory();
+        let mut server = Server::new(conn, Some(dir.path().to_path_buf()));
+        let text: Rc<str> = "a()\nb()\nc()\n".into();
+        let note = |id: &str, line| {
+            Note::new_on(
+                id.into(),
+                "x.py".into(),
+                &text,
+                line,
+                line,
+                "open",
+                "t".into(),
+                "# n".into(),
+            )
+            .unwrap()
+        };
+        server.notes.edit().push(note("aaaaaaaa", 2));
+        let first = server.anchors("x.py", &text);
+        assert_eq!(&first[..], [(0, Anchor::Exact { start: 2, end: 2 })]);
+        assert!(Rc::ptr_eq(&first, &server.anchors("x.py", &text)));
+
+        // New text, even with the same content, is located again.
+        let moved: Rc<str> = format!("z()\n{text}").into();
+        assert_eq!(
+            &server.anchors("x.py", &moved)[..],
+            [(0, Anchor::Moved { start: 3, end: 3 })]
+        );
+        let same: Rc<str> = text.to_string().into();
+        assert!(!Rc::ptr_eq(&first, &server.anchors("x.py", &same)));
+
+        // So are changed notes.
+        server.notes.edit().push(note("bbbbbbbb", 3));
+        assert_eq!(server.anchors("x.py", &same).len(), 2);
+        server.notes.edit()[0] = note("aaaaaaaa", 1);
+        assert_eq!(
+            server.anchors("x.py", &same)[0],
+            (0, Anchor::Exact { start: 1, end: 1 })
+        );
+        assert!(server.anchors("y.py", &same).is_empty());
+    }
+
+    fn written_by(author: &str, source: Option<&str>, body: &str) -> Note {
+        let mut n = Note::new_on(
+            "aaaaaaaa".into(),
+            "x.py".into(),
+            "a()\n",
+            1,
+            1,
+            "open",
+            author.into(),
+            body.into(),
+        )
+        .unwrap();
+        n.meta.source = source.map(String::from);
+        n
+    }
+
+    #[test]
+    fn notes_you_did_not_write_are_marked() {
+        let me = ["Sam", "sam-git"];
+        let by = |author, source, committer| {
+            provenance(&written_by(author, source, "# n"), &me, committer)
+        };
+        assert_eq!(by("Sam", None, None), "");
+        assert_eq!(by("sam-git (agent)", None, Some("Sam")), "");
+        assert_eq!(by("Mallory", None, None), " · not written by you");
+        assert_eq!(by("Mallory (agent)", None, None), " · not written by you");
+        // A scanner's finding shows its rule instead.
+        assert_eq!(by("semgrep", Some("semgrep"), Some("sam-git")), "");
+        // The author is what the file says; git says who put it there.
+        assert_eq!(
+            by("Sam", Some("semgrep"), Some("Mal_lory")),
+            r" · last committed by Mal\_lory"
+        );
+    }
+
+    #[test]
+    fn hover_links_are_not_clickable() {
+        let body = "# Title [t](http://evil)\n\nSee <http://evil> and [ref][r], `[code](http://ok)`\n\n```\n[fenced](http://ok)\n```\n\n[r]: http://evil/r";
+        let note = written_by("Mallory", None, body);
+        let text = hover_text(
+            &note,
+            Anchor::Exact { start: 1, end: 1 },
+            &Config::default(),
+            " · not written by you",
+        );
+        assert!(
+            text.starts_with("**Review note · Open** · not written by you\n\n# Title t (`http://evil`)\n\nSee `http://evil` and ref (`http://evil/r`), `[code](http://ok)`\n\n```\n[fenced](http://ok)\n```\n\n\\[r\\]: `http://evil/r`\n\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn tags_are_searchable_and_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.py"), "a()\n").unwrap();
+        let (conn, _client) = Connection::memory();
+        let mut server = Server::new(conn, Some(dir.path().to_path_buf()));
+        let mut note = written_by("semgrep", Some("semgrep"), "# SQL injection");
+        note.meta.tags = vec!["cwe-89".into(), "sec_rity".into()];
+        server.notes.edit().push(note.clone());
+        let names =
+            |q: &str| -> Vec<String> { server.symbols(q).into_iter().map(|s| s.name).collect() };
+        assert_eq!(names("cwe89"), ["[Open] SQL injection #cwe-89 #sec_rity"]);
+        assert_eq!(names("sql cwe"), names("cwe89"));
+        assert!(names("cwe-22").is_empty());
+        let text = hover_text(
+            &note,
+            Anchor::Exact { start: 1, end: 1 },
+            &Config::default(),
+            "",
+        );
+        assert!(text.contains(r" · tags cwe-89, sec\_rity · "), "{text}");
+    }
+
+    #[test]
+    fn accepting_code_that_is_not_changed_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.py"), "a()\n").unwrap();
+        let (conn, _client) = Connection::memory();
+        let mut server = Server::new(conn, Some(dir.path().to_path_buf()));
+        let note = written_by("me", None, "# n");
+        let store = Store::new(dir.path());
+        store.save(&note).unwrap();
+        server.reload();
+        let err = server
+            .execute(CMD_ACCEPT, &[json!(note.meta.id)])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no longer marked changed"),
+            "{err}"
+        );
+        assert_eq!(store.load(&note.meta.id).unwrap(), note);
     }
 
     #[test]

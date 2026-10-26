@@ -1,0 +1,5 @@
+import os
+
+DEBUG = os.environ.get("DEBUG") == "1"
+AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
+AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]

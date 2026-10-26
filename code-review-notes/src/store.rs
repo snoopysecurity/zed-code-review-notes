@@ -1,6 +1,7 @@
-//! `.code-review-notes/` on disk: one `<id>.md` file per note.
+//! `.code-review-notes/` on disk, one `<id>.md` per note.
 
 use anyhow::Context;
+use std::cell::OnceCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,12 +13,31 @@ use crate::safety::{self, MAX_NOTE_BYTES, MAX_SOURCE_BYTES};
 
 pub const DIR: &str = ".code-review-notes";
 
+/// An unreadable note file, or a store-wide problem when `path` is `None`
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadError {
+    pub path: Option<PathBuf>,
+    pub message: String,
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.path.as_deref().and_then(Path::file_name) {
+            Some(name) => write!(f, "{}: {}", name.to_string_lossy(), self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
 pub struct Store {
     root: PathBuf,
     dir: PathBuf,
+    /// Cached git `user.name`. [`Store::author`] runs for every note written and
+    /// shelling out to git each time is slow on big repos.
+    git_user: OnceCell<Option<String>>,
 }
 
-/// Walk up from `start` to the nearest directory holding `.code-review-notes/` or `.git/`.
+/// Nearest ancestor of `start` with `.code-review-notes/` or `.git/`
 pub fn discover(start: &Path) -> PathBuf {
     let start = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
     start
@@ -27,7 +47,7 @@ pub fn discover(start: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// Read and check one note file, refusing symlinks planted in the store.
+/// Refuses symlinks planted in the store
 fn read_note(path: &Path) -> anyhow::Result<Note> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     if fs::symlink_metadata(path).is_ok_and(|m| !m.is_file()) {
@@ -48,6 +68,7 @@ impl Store {
         Store {
             dir: root.join(DIR),
             root,
+            git_user: OnceCell::new(),
         }
     }
 
@@ -60,9 +81,9 @@ impl Store {
         &self.dir
     }
 
-    /// The store directory, unless it is a symlink: a hostile repository could
-    /// point `.code-review-notes` outside the project to have us read or write
-    /// there. Fine if it does not exist yet.
+    /// Refuses a symlinked store dir, since a hostile repo could point
+    /// `.code-review-notes` outside the project and have us read or write there.
+    /// Not existing yet is fine.
     fn checked_dir(&self) -> anyhow::Result<&Path> {
         match fs::symlink_metadata(&self.dir) {
             Ok(m) if m.file_type().is_symlink() => Err(safety::SafetyError::PathEscape {
@@ -73,7 +94,7 @@ impl Store {
         }
     }
 
-    /// The project's statuses, plus a warning if `config.toml` was invalid.
+    /// Statuses, plus a warning if `config.toml` was invalid
     pub fn config(&self) -> (Config, Option<String>) {
         match self.checked_dir() {
             Ok(dir) => Config::load(dir),
@@ -88,7 +109,7 @@ impl Store {
         self.dir.join(crate::config::FILE)
     }
 
-    /// Write the default `config.toml` if there is none. Returns whether it wrote one.
+    /// Writes the default `config.toml` if missing. Returns true if it did
     pub fn init(&self) -> anyhow::Result<bool> {
         let path = self.config_path();
         if path.exists() {
@@ -103,15 +124,18 @@ impl Store {
         self.dir.join(format!("{id}.md"))
     }
 
-    /// Load every note. Unreadable or invalid files are reported and skipped, so
-    /// one bad file never hides the rest.
-    pub fn load_all(&self) -> (Vec<Note>, Vec<String>) {
+    /// Bad or unreadable files are reported and skipped. One broken note
+    /// shouldn't hide the rest.
+    pub fn load_all(&self) -> (Vec<Note>, Vec<LoadError>) {
         let mut notes = Vec::new();
         let mut errors = Vec::new();
         let dir = match self.checked_dir() {
             Ok(dir) => dir,
             Err(e) => {
-                errors.push(format!("{e:#}"));
+                errors.push(LoadError {
+                    path: None,
+                    message: format!("{e:#}"),
+                });
                 return (notes, errors);
             }
         };
@@ -127,22 +151,20 @@ impl Store {
         for path in paths {
             match read_note(&path) {
                 Ok(note) => notes.push(note),
-                Err(e) => {
-                    let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    errors.push(format!("{name}: {e:#}"));
-                }
+                Err(e) => errors.push(LoadError {
+                    message: format!("{e:#}"),
+                    path: Some(path),
+                }),
             }
         }
         (notes, errors)
     }
 
-    /// Load one note from disk.
     pub fn load(&self, id: &str) -> anyhow::Result<Note> {
         self.checked_dir()?;
         read_note(&self.note_path(id))
     }
 
-    /// A project file's text, for locating notes in it.
     pub fn read_source(&self, rel: &str) -> anyhow::Result<String> {
         let path = safety::confine(self.root(), rel)?;
         safety::read_limited(&path, MAX_SOURCE_BYTES, rel)
@@ -159,8 +181,8 @@ impl Store {
         fs::remove_file(self.note_path(id)).with_context(|| format!("deleting note {id}"))
     }
 
-    /// Write to a temp file in the store, fsync, then rename over the target, so
-    /// a crash leaves either the old note or the new one, never half of one.
+    /// Temp file in the store, fsync, rename over the target. A crash leaves the
+    /// old note or the new one, never half of one.
     fn write_atomic(&self, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         self.checked_dir()?;
         fs::create_dir_all(&self.dir).context("creating .code-review-notes/")?;
@@ -168,7 +190,7 @@ impl Store {
             .prefix(".tmp-")
             .tempfile_in(&self.dir)?;
         tmp.write_all(bytes)?;
-        // Temp files are created private (0600); notes are ordinary project files.
+        // temp files start out 0600, notes are ordinary project files
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -181,7 +203,6 @@ impl Store {
         Ok(())
     }
 
-    /// A fresh id that no existing note uses.
     pub fn new_id(&self, seed: &str) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -196,27 +217,55 @@ impl Store {
             .unwrap_or_else(|| hash[..32].to_string())
     }
 
-    /// `REVIEW_NOTES_AUTHOR`, then git `user.name`, then the OS user.
+    /// `REVIEW_NOTES_AUTHOR`, then git `user.name`, then the OS user
     pub fn author(&self) -> String {
         if let Ok(a) = std::env::var("REVIEW_NOTES_AUTHOR")
             && !a.trim().is_empty()
         {
             return a.trim().to_string();
         }
-        let git = std::process::Command::new("git")
-            .args(["config", "user.name"])
-            .current_dir(&self.root)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty());
-        git.or_else(|| std::env::var("USER").ok())
+        self.git_user()
+            .map(str::to_string)
+            .or_else(|| std::env::var("USER").ok())
             .or_else(|| std::env::var("USERNAME").ok())
             .unwrap_or_else(|| "unknown".to_string())
     }
 
-    /// Worktree-relative POSIX path for an absolute path inside the root.
+    pub fn git_user(&self) -> Option<&str> {
+        self.git_user
+            .get_or_init(|| {
+                std::process::Command::new("git")
+                    .args(["config", "user.name"])
+                    .current_dir(&self.root)
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .as_deref()
+    }
+
+    /// Last committer of the note file, per git. `None` if uncommitted or git
+    /// can't tell. `author` is just what the file claims; this is who actually
+    /// put it in the repo.
+    pub fn last_committer(&self, id: &str) -> Option<String> {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .arg(self.note_path(id))
+                .current_dir(&self.root)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        };
+        // check the index first, `git log` on an unknown file walks all of history
+        // just to report nothing
+        git(&["ls-files", "--error-unmatch", "--"])?;
+        let out = git(&["log", "-1", "--format=%an", "--"])?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|s| !s.is_empty())
+    }
+
     pub fn relative(&self, abs: &Path) -> Option<String> {
         let abs = fs::canonicalize(abs).unwrap_or_else(|_| abs.to_path_buf());
         let rel = abs.strip_prefix(&self.root).ok()?;
@@ -246,8 +295,12 @@ mod tests {
                 created: "2026-10-09T10:00:00Z".parse().unwrap(),
                 source: None,
                 rule: None,
+                tags: Vec::new(),
                 fingerprint: None,
                 snippet: "x".into(),
+                context_before: None,
+                context_after: None,
+                extra: Default::default(),
             },
             body: "hi".into(),
         }
@@ -267,7 +320,7 @@ mod tests {
         let (notes, errors) = store.load_all();
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(notes.len(), 15);
-        // No temp files left behind.
+        // no leftover temp files
         let leftovers = fs::read_dir(store.dir())
             .unwrap()
             .filter(|e| {
@@ -326,6 +379,43 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["aaaaaaaa.md"]);
+    }
+
+    #[test]
+    fn git_user_name_is_asked_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Alice Reviewer"]);
+        let store = Store::new(dir.path());
+        assert_eq!(store.git_user(), Some("Alice Reviewer"));
+        git(&["config", "user.name", "Bob"]);
+        assert_eq!(store.git_user(), Some("Alice Reviewer"));
+        // fresh store (like after a restart) asks git again
+        assert_eq!(Store::new(dir.path()).git_user(), Some("Bob"));
+
+        store.save(&note("aaaaaaaa")).unwrap();
+        assert_eq!(store.last_committer("aaaaaaaa"), None);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=m@example.com",
+            "-c",
+            "user.name=Mallory",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "x",
+        ]);
+        assert_eq!(store.last_committer("aaaaaaaa").as_deref(), Some("Mallory"));
+        assert_eq!(store.last_committer("bbbbbbbb"), None);
     }
 
     #[test]

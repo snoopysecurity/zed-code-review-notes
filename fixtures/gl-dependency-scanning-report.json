@@ -1,0 +1,71 @@
+{
+  "version": "15.2.5",
+  "vulnerabilities": [
+    {
+      "id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c65",
+      "name": "Django SQL injection in QuerySet.values() and values_list()",
+      "description": "QuerySet.values() and values_list() on models with a JSONField are subject to SQL injection in column aliases.",
+      "severity": "Critical",
+      "solution": "Upgrade to versions 3.2.15, 4.0.7 or above.",
+      "identifiers": [
+        {
+          "type": "gemnasium",
+          "name": "Gemnasium-6c2b1a3f-0a6e-4d36-9a0f-1b0a3c6e1d2f",
+          "value": "6c2b1a3f-0a6e-4d36-9a0f-1b0a3c6e1d2f",
+          "url": "https://gitlab.com/gitlab-org/security-products/gemnasium-db/-/blob/master/pypi/Django/CVE-2022-34265.yml"
+        },
+        {
+          "type": "cve",
+          "name": "CVE-2022-34265",
+          "value": "CVE-2022-34265",
+          "url": "https://nvd.nist.gov/vuln/detail/CVE-2022-34265"
+        },
+        {
+          "type": "cwe",
+          "name": "CWE-89",
+          "value": "89"
+        }
+      ],
+      "links": [
+        {
+          "url": "https://www.djangoproject.com/weblog/2022/jul/04/security-releases/"
+        }
+      ],
+      "location": {
+        "file": "requirements.txt",
+        "dependency": {
+          "package": {
+            "name": "Django"
+          },
+          "version": "3.2.0",
+          "direct": true
+        }
+      }
+    }
+  ],
+  "dependency_files": [],
+  "scan": {
+    "analyzer": {
+      "id": "gemnasium-python",
+      "name": "gemnasium-python",
+      "url": "https://gitlab.com/gitlab-org/security-products/analyzers/gemnasium",
+      "vendor": {
+        "name": "GitLab"
+      },
+      "version": "5.8.0"
+    },
+    "scanner": {
+      "id": "gemnasium-python",
+      "name": "gemnasium-python",
+      "url": "https://gitlab.com/gitlab-org/security-products/analyzers/gemnasium",
+      "vendor": {
+        "name": "GitLab"
+      },
+      "version": "5.8.0"
+    },
+    "type": "dependency_scanning",
+    "start_time": "2026-10-14T09:12:06",
+    "end_time": "2026-10-14T09:12:30",
+    "status": "success"
+  }
+}

@@ -1,0 +1,118 @@
+---
+source: code-review-notes/src/export.rs
+expression: out
+---
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "originalUriBaseIds": {
+        "%SRCROOT%": {
+          "description": {
+            "text": "The project root"
+          }
+        }
+      },
+      "results": [
+        {
+          "level": "error",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "a.py",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "endLine": 4,
+                  "snippet": {
+                    "text": "db.query(f\"{id}\")\n"
+                  },
+                  "startLine": 3
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "SQL @all [x](http://evil) `t`"
+          },
+          "partialFingerprints": {
+            "codeReviewNotes/v1": "aaaaaaaa"
+          },
+          "properties": {
+            "author": "alice",
+            "body": "# SQL @all [x](http://evil) `t`\n\n/assign @someone\n![p](http://evil/p.png)\n```\nfence\n```",
+            "changed": true,
+            "created": "2026-10-01T10:00:00Z",
+            "noteId": "aaaaaaaa",
+            "source": "semgrep",
+            "stale": false,
+            "status": "issue",
+            "statusLabel": "Issue",
+            "tags": [
+              "cwe-89",
+              "sec_rity"
+            ]
+          },
+          "ruleId": "python.sqli",
+          "ruleIndex": 1
+        },
+        {
+          "level": "none",
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "b.py",
+                  "uriBaseId": "%SRCROOT%"
+                },
+                "region": {
+                  "endLine": 2,
+                  "snippet": {
+                    "text": "x\n"
+                  },
+                  "startLine": 1
+                }
+              }
+            }
+          ],
+          "message": {
+            "text": "Fine"
+          },
+          "partialFingerprints": {
+            "codeReviewNotes/v1": "bbbbbbbb"
+          },
+          "properties": {
+            "author": "alice",
+            "body": "# Fine",
+            "changed": false,
+            "created": "2026-10-01T10:00:00Z",
+            "noteId": "bbbbbbbb",
+            "source": null,
+            "stale": true,
+            "status": "ok",
+            "statusLabel": "OK",
+            "tags": []
+          },
+          "ruleId": "code-review-note",
+          "ruleIndex": 0
+        }
+      ],
+      "tool": {
+        "driver": {
+          "name": "code-review-notes",
+          "rules": [
+            {
+              "id": "code-review-note"
+            },
+            {
+              "id": "python.sqli"
+            }
+          ],
+          "version": "0.1.0"
+        }
+      }
+    }
+  ],
+  "version": "2.1.0"
+}

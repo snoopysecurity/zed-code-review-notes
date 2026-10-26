@@ -2,22 +2,24 @@ id = "code-review-notes"
 name = "Code Review Notes"
 version = "0.1.0"
 schema_version = 1
-authors = ["Sam Sanoop <ssanoop@gitlab.com>"]
+authors = ["Sam Sanoop <https://github.com/snoopysecurity>"]
 description = "Keep notes on code during a review, and import SAST findings (SARIF, brakeman)."
-repository = "https://github.com/OWNER/code-review-notes"  # TODO: the real GitHub URL, before publishing
+repository = "https://github.com/snoopysecurity/zed-code-review-notes"
+
+# MCP server so Zed's agent can list, read, add and mark notes.
+[context_servers.code-review-notes]
 
 [language_servers.code-review-notes]
 name = "Code Review Notes"
-# Names must match each language's `name` in Zed exactly; there is no
-# wildcard. Languages from extensions that are not installed are ignored.
-# "Plain Text" is what Zed gives every file no language claims (`.rb` without
-# the Ruby extension, say), so notes work there too.
+# Has to match each language's `name` exactly, no wildcard support.
+# Uninstalled extension languages are just ignored. "Plain Text" covers files
+# no language claims (e.g. `.rb` without the Ruby extension).
 languages = [
-  # Built into Zed
+  # built in
   "C", "C++", "CSS", "Diff", "Env", "Git Commit", "Go", "Go Mod", "Go Work",
   "JavaScript", "JSON", "JSONC", "Markdown", "Plain Text", "Python", "Rust",
   "Shell Script", "TSX", "TypeScript", "YAML",
-  # From extensions
+  # extensions
   "Alex", "Astro", "Cabal", "CSharp", "Dart", "Docker Compose", "Dockerfile",
   "EEx", "Elixir", "Elm", "ERB", "Erlang", "GLSL", "Gradle", "Gradle KTS",
   "GraphQL", "Groovy", "Haskell", "HCL", "HEEx", "HTML", "HTML+ERB", "Java",

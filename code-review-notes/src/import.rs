@@ -1,7 +1,5 @@
-//! Turning scanner output into review notes (with the default status).
-//!
-//! Parsers only produce [`RawFinding`]s; all filesystem access (confining the
-//! path, reading the snippet) happens once, in [`ingest`].
+//! Scanner reports into review notes. Parsers only build [`RawFinding`]s;
+//! confining paths and reading snippets is left to [`ingest`].
 
 use anyhow::{Context, bail};
 use chrono::{SubsecRound, Utc};
@@ -9,37 +7,52 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::anchor;
+use crate::anchor::{self, Code};
 use crate::config::Config;
 use crate::markdown::{inline_code, md_escape};
-use crate::note::{Meta, Note};
+use crate::note::{MAX_TAGS, Meta, Note, tag_from_scanner};
 use crate::safety::{self, MAX_IMPORT_BYTES, MAX_SOURCE_BYTES};
 use crate::store::Store;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RawFinding {
     pub tool: String,
-    /// As given by the scanner; validated in `ingest`.
+    /// Untrusted, checked in `ingest`
     pub uri: String,
-    /// `uri` made relative to a root the report names (its source root or
-    /// working directory), for reports written on another machine. Tried when
-    /// `uri` itself is not in the project; validated the same way.
+    /// `uri` relative to a root the report names, for reports made on another
+    /// machine. Fallback when `uri` isn't in the project.
     pub stripped: Option<String>,
     pub start_line: u32,
     pub end_line: u32,
     pub rule: String,
     pub message: String,
     pub level: Option<String>,
+    pub tags: Vec<String>,
+    pub flow: Vec<FlowStep>,
 }
+
+/// Display only. `location` is whatever the report said, never a checked path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlowStep {
+    pub location: String,
+    pub message: Option<String>,
+}
+
+/// Steps past this are just counted
+const MAX_FLOW_STEPS: usize = 20;
+/// chars, per location or message
+const MAX_STEP_CHARS: usize = 200;
 
 #[derive(Debug, Default)]
 pub struct Summary {
     pub tools: Vec<String>,
     pub imported: usize,
     pub skipped: usize,
-    /// Suppressed, or not a failure (`pass`, `notApplicable`, fixed since the baseline).
+    /// suppressed, `pass`/`notApplicable`, or absent per the baseline
     pub ignored: usize,
     pub rejected: Vec<String>,
+    /// `None` unless [`Options::resolve_missing`] was set. Entries are `id file:line title`.
+    pub resolved: Option<Vec<String>>,
 }
 
 impl std::fmt::Display for Summary {
@@ -56,30 +69,57 @@ impl std::fmt::Display for Summary {
             self.skipped,
             self.ignored,
             self.rejected.len()
-        )
+        )?;
+        if let Some(resolved) = &self.resolved {
+            write!(f, ", resolved {} (no longer reported)", resolved.len())?;
+        }
+        Ok(())
     }
 }
 
-const FORMAT_HINT: &str = "expected SARIF or brakeman JSON. Ask your scanner for SARIF: \
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Options {
+    /// Notes from this report's tools that it no longer reports get `resolved_status`.
+    pub resolve_missing: bool,
+}
+
+const FORMAT_HINT: &str = "expected SARIF, a GitLab security report or brakeman JSON. Ask your scanner for SARIF: \
     `semgrep --sarif`, `codeql database analyze --format=sarif-latest`, \
     `snyk code test --sarif-file-output=FILE`, `bandit -f sarif`, `gosec -fmt sarif`, `checkov -o sarif`, `brakeman -f json`";
 
 pub fn import_file(store: &Store, config: &Config, path: &Path) -> anyhow::Result<Summary> {
+    import_file_with(store, config, path, Options::default())
+}
+
+pub fn import_file_with(
+    store: &Store,
+    config: &Config,
+    path: &Path,
+    options: Options,
+) -> anyhow::Result<Summary> {
     let text = safety::read_limited(path, MAX_IMPORT_BYTES, "scanner report")
         .with_context(|| format!("reading {}", path.display()))?;
-    import_text(store, config, &text)
+    import_text_with(store, config, &text, options)
 }
 
 pub fn import_text(store: &Store, config: &Config, text: &str) -> anyhow::Result<Summary> {
-    Ok(ingest(store, config, parse(text)?))
+    import_text_with(store, config, text, Options::default())
 }
 
-/// What a parser got out of a report: usable findings, and a reason for each
-/// result that could not become a note (no file, no line).
+pub fn import_text_with(
+    store: &Store,
+    config: &Config,
+    text: &str,
+    options: Options,
+) -> anyhow::Result<Summary> {
+    ingest(store, config, parse(text)?, options)
+}
+
 #[derive(Debug, Default)]
 pub struct Parsed {
-    /// Every tool with results in the report, even if none became a finding.
     pub tools: Vec<String>,
+    /// Includes runs with zero results. Those still matter when resolving old findings.
+    pub ran: Vec<String>,
     pub findings: Vec<RawFinding>,
     pub ignored: usize,
     pub rejected: Vec<String>,
@@ -88,12 +128,89 @@ pub struct Parsed {
 pub fn parse(text: &str) -> anyhow::Result<Parsed> {
     let doc: Value =
         serde_json::from_str(text).with_context(|| format!("not valid JSON; {FORMAT_HINT}"))?;
-    if doc.get("runs").is_some_and(Value::is_array) {
-        Ok(parse_sarif(&doc))
-    } else if doc.get("warnings").is_some_and(Value::is_array) {
-        Ok(parse_brakeman(&doc))
+    let shape = |key: &str| match doc.get(key) {
+        Some(Value::Array(_)) => Shape::Array,
+        Some(Value::Object(_)) => Shape::Object,
+        _ => Shape::Other,
+    };
+    match format_of(shape) {
+        Some(Format::Sarif) => Ok(parse_sarif(&doc)),
+        Some(Format::Gitlab) => Ok(parse_gitlab(&doc)),
+        Some(Format::Brakeman) => Ok(parse_brakeman(&doc)),
+        None => bail!("unrecognised report format; {FORMAT_HINT}"),
+    }
+}
+
+/// Cheap shape check, nothing gets built. Decides whether an open `.json` is
+/// offered for import.
+pub fn is_report(text: &str) -> bool {
+    serde_json::from_str::<HashMap<String, Shape>>(text)
+        .is_ok_and(|top| format_of(|key| top.get(key).copied().unwrap_or(Shape::Other)).is_some())
+}
+
+enum Format {
+    Sarif,
+    Gitlab,
+    Brakeman,
+}
+
+/// Shared by [`parse`] and [`is_report`] so the two can't disagree.
+fn format_of(shape: impl Fn(&str) -> Shape) -> Option<Format> {
+    if shape("runs") == Shape::Array {
+        Some(Format::Sarif)
+    } else if shape("vulnerabilities") == Shape::Array && shape("scan") == Shape::Object {
+        Some(Format::Gitlab)
+    } else if shape("warnings") == Shape::Array {
+        Some(Format::Brakeman)
     } else {
-        bail!("unrecognised report format; {FORMAT_HINT}")
+        None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape {
+    Array,
+    Object,
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for Shape {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Shape, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Shape;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Shape, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Shape::Array)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Shape, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Shape::Object)
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Shape, E> {
+                Ok(Shape::Other)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Shape, E> {
+                Ok(Shape::Other)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Shape, E> {
+                Ok(Shape::Other)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Shape, E> {
+                Ok(Shape::Other)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Shape, E> {
+                Ok(Shape::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Shape, E> {
+                Ok(Shape::Other)
+            }
+        }
+        d.deserialize_any(V)
     }
 }
 
@@ -107,14 +224,17 @@ fn line(v: Option<&Value>) -> Option<u32> {
         .and_then(|n| u32::try_from(n).ok())
 }
 
-/// Follows SARIF 2.1.0 (§3 refers to its sections) for the parts that place a
-/// finding on a line and describe it; everything else in the report is ignored.
+/// SARIF 2.1.0 (the § numbers are spec sections). Only reads what's needed to
+/// place a finding on a line and describe it.
 fn parse_sarif(doc: &Value) -> Parsed {
     let mut out = Parsed::default();
     for run in doc["runs"].as_array().into_iter().flatten() {
         let tool = str_at(run, &["tool", "driver", "name"])
             .unwrap_or("sarif")
             .to_string();
+        if !out.ran.contains(&tool) {
+            out.ran.push(tool.clone());
+        }
         if run["results"].as_array().is_some_and(|r| !r.is_empty()) && !out.tools.contains(&tool) {
             out.tools.push(tool.clone());
         }
@@ -130,7 +250,7 @@ fn parse_sarif(doc: &Value) -> Parsed {
                 format!("{tool} result {} ({rule})", i + 1)
             };
 
-            // The first location that has both a file and a line (§3.27.12).
+            // first location with both a file and a line (§3.27.12)
             let mut unlined = None;
             let mut found = None;
             for loc in result["locations"].as_array().into_iter().flatten() {
@@ -187,14 +307,49 @@ fn parse_sarif(doc: &Value) -> Parsed {
                 rule,
                 message,
                 level,
+                tags: note_tags(
+                    [rule_entry, Some(result)]
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|v| v["properties"]["tags"].as_array().into_iter().flatten())
+                        .filter_map(Value::as_str),
+                ),
+                flow: data_flow(run, result, &roots),
             });
         }
     }
     out
 }
 
-/// Not suppressed (§3.27.23, §3.35.3), still present (§3.27.24) and a failure
-/// (§3.27.9). `informational` and `review` results are kept for the reviewer.
+/// First thread flow of the first code flow (§3.36, §3.37)
+fn data_flow(run: &Value, result: &Value, roots: &[String]) -> Vec<FlowStep> {
+    let one_line = |s: &str, max| capped(&s.split_whitespace().collect::<Vec<_>>().join(" "), max);
+    result["codeFlows"][0]["threadFlows"][0]["locations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|step| {
+            let loc = &step["location"];
+            let physical = &loc["physicalLocation"];
+            let file = artifact_uri(run, &physical["artifactLocation"])
+                .map(|uri| strip_root(&uri, roots).unwrap_or(uri));
+            let location = match (file, line(physical["region"].get("startLine"))) {
+                (Some(file), Some(line)) => format!("{file}:{line}"),
+                (Some(file), None) => file,
+                (None, _) => "(no location)".to_string(),
+            };
+            FlowStep {
+                location: one_line(&location, MAX_STEP_CHARS),
+                message: str_at(loc, &["message", "text"])
+                    .map(|m| one_line(&strip_location_links(m), MAX_STEP_CHARS))
+                    .filter(|m| !m.is_empty()),
+            }
+        })
+        .collect()
+}
+
+/// Drops suppressed (§3.27.23, §3.35.3), absent (§3.27.24) and non-failure
+/// (§3.27.9) results. `informational` and `review` stay, a reviewer may want them.
 fn is_live_failure(result: &Value) -> bool {
     let suppressed = result["suppressions"]
         .as_array()
@@ -211,13 +366,12 @@ fn is_absolute_uri(uri: &str) -> bool {
     uri.starts_with('/') || safety::has_scheme_or_drive(uri)
 }
 
-/// `uri` resolved against `base` through `originalUriBaseIds`, whose entries
-/// may themselves be relative to another base (§3.14.14). An unknown base
-/// leaves `uri` relative, which is what most reports intend: the project root.
+/// Resolves through `originalUriBaseIds`, which can chain (§3.14.14). An unknown
+/// base leaves `uri` relative to the project root. Usually what the report meant.
 fn resolve_uri(run: &Value, uri: &str, base: Option<&str>) -> String {
     let mut uri = uri.to_string();
     let mut base = base.map(str::to_string);
-    // Each base once, so a report whose bases refer to each other cannot loop.
+    // bases can refer to each other; don't loop forever
     let mut seen = HashSet::new();
     while let Some(b) = base.take() {
         if is_absolute_uri(&uri) || !seen.insert(b.clone()) {
@@ -237,8 +391,6 @@ fn resolve_uri(run: &Value, uri: &str, base: Option<&str>) -> String {
     uri
 }
 
-/// The file an `artifactLocation` names, directly or through `run.artifacts`
-/// (§3.4.5), with its base resolved.
 fn artifact_uri(run: &Value, al: &Value) -> Option<String> {
     let artifact = al["index"]
         .as_u64()
@@ -246,8 +398,8 @@ fn artifact_uri(run: &Value, al: &Value) -> Option<String> {
         .map(|a| &a["location"]);
     let artifact_uri = artifact.and_then(|a| str_at(a, &["uri"]));
     let uri = str_at(al, &["uri"]).or(artifact_uri)?;
-    // The artifact's base applies when the location names the same file
-    // without one of its own.
+    // Inherit the artifact's base only if this names the same file and has
+    // no base of its own.
     let base = str_at(al, &["uriBaseId"]).or_else(|| {
         artifact
             .filter(|_| artifact_uri == Some(uri))
@@ -256,7 +408,6 @@ fn artifact_uri(run: &Value, al: &Value) -> Option<String> {
     Some(resolve_uri(run, uri, base))
 }
 
-/// A local `file:` uri or plain absolute path, decoded.
 fn local_path(uri: &str) -> Option<String> {
     if uri.starts_with("file:") {
         return safety::file_uri_path(uri)?.to_str().map(str::to_string);
@@ -264,10 +415,9 @@ fn local_path(uri: &str) -> Option<String> {
     percent_decode(uri).filter(|p| p.starts_with('/'))
 }
 
-/// The absolute directories the report says it was produced in: its base uris
-/// and the invocations' working directories. Roots fewer than two directories
-/// deep (`/`, `/home`) would map almost any path onto the project, so they are
-/// left out.
+/// Absolute dirs the report claims it ran in (base uris, invocation working dirs).
+/// Anything shallower than two levels (`/`, `/home`) is dropped. It would match
+/// nearly any path.
 fn report_roots(run: &Value) -> Vec<String> {
     let bases = run["originalUriBaseIds"]
         .as_object()
@@ -297,14 +447,13 @@ fn report_roots(run: &Value) -> Vec<String> {
                 >= 2
         })
         .collect();
-    // Longest first, so the most specific root wins.
+    // most specific root first
     roots.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     roots.dedup();
     roots
 }
 
-/// An absolute `uri` under one of `roots`, relative to it. Whether the result
-/// is safe to use is decided in `ingest`, like any other relative path.
+/// Result still goes through the usual checks in `ingest`.
 fn strip_root(uri: &str, roots: &[String]) -> Option<String> {
     let path = local_path(uri)?;
     roots.iter().find_map(|root| {
@@ -317,8 +466,7 @@ fn strip_root(uri: &str, roots: &[String]) -> Option<String> {
     })
 }
 
-/// The rules of the tool component a reference names (§3.54): an extension
-/// by index or name, else the driver.
+/// §3.54
 fn component<'a>(run: &'a Value, reference: &Value) -> Option<&'a Value> {
     let tool = &run["tool"];
     if reference.is_null() {
@@ -338,8 +486,8 @@ fn component<'a>(run: &'a Value, reference: &Value) -> Option<&'a Value> {
     named("guid").or_else(|| named("name"))
 }
 
-/// Every rule in a run by id: the driver's, then each extension's, as recent
-/// CodeQL keeps one per query pack (§3.52.4). The first rule with an id wins.
+/// Rules by id across the driver and all extensions. Recent CodeQL puts each
+/// query pack in its own extension (§3.52.4). First rule with a given id wins.
 struct RuleIndex<'a>(HashMap<&'a str, &'a Value>);
 
 impl<'a> RuleIndex<'a> {
@@ -355,8 +503,7 @@ impl<'a> RuleIndex<'a> {
         RuleIndex(by_id)
     }
 
-    /// The rule for `id`, or for the longest rule id it refines: a ruleId may be
-    /// `rule/sub` (§3.27.5).
+    /// ruleId may be `rule/sub` (§3.27.5). Falls back to the longest known prefix.
     fn by_id(&self, id: &str) -> Option<&'a Value> {
         let mut id = id;
         loop {
@@ -367,8 +514,8 @@ impl<'a> RuleIndex<'a> {
         }
     }
 
-    /// The rule metadata for a result (§3.27.6): by index into the component
-    /// it names, if that rule agrees with the result's id, else by id.
+    /// §3.27.6. An index lookup only counts if that rule's id agrees with the
+    /// result's; otherwise look it up by id.
     fn entry(&self, run: &'a Value, result: &Value) -> Option<&'a Value> {
         let id = str_at(result, &["ruleId"]).or_else(|| str_at(result, &["rule", "id"]));
         let agrees = |r: &Value| {
@@ -389,8 +536,7 @@ impl<'a> RuleIndex<'a> {
     }
 }
 
-/// The result's message as plain text (§3.11): its own text, or the template
-/// it names, with arguments filled in and links to related locations removed.
+/// Plain-text message (§3.11), templates filled in, location links stripped.
 fn message_text(run: &Value, result: &Value, rule: Option<&Value>) -> Option<String> {
     let msg = &result["message"];
     let template = || {
@@ -410,7 +556,7 @@ fn message_text(run: &Value, result: &Value, rule: Option<&Value>) -> Option<Str
         },
     };
     let args = msg["arguments"].as_array();
-    // Only messages meant to be formatted: a literal `{{` elsewhere stays as is.
+    // untemplated text keeps any literal `{{`
     let text = if templated || args.is_some() {
         let args: Vec<&str> = args
             .into_iter()
@@ -457,10 +603,8 @@ fn format_message(template: &str, args: &[&str]) -> String {
     out
 }
 
-/// `[user input](1)` → `user input`: in plain-text SARIF messages a link to a
-/// number points at one of the result's related locations (§3.11.6), which a
-/// note cannot follow. `\[` and `\]` are literal brackets. Links to anything
-/// else are left for `md_escape` to defuse.
+/// `[user input](1)` → `user input`. A numeric target means a related location
+/// (§3.11.6), which a note can't follow. Other links are left for `md_escape`.
 fn strip_location_links(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -480,8 +624,8 @@ fn strip_location_links(text: &str) -> String {
     out
 }
 
-/// `[label](digits)` at the start of `s`: the label with escapes removed, and
-/// the link's length. The label ends at the first unescaped `]`.
+/// Label ends at the first unescaped `]`. Returns the unescaped label and the
+/// link's byte length.
 fn location_link(s: &str) -> Option<(String, usize)> {
     let body = s.strip_prefix('[')?;
     let mut label = String::new();
@@ -502,9 +646,133 @@ fn location_link(s: &str) -> Option<(String, usize)> {
         .then(|| (label, 1 + close + 1 + 1 + digits + 1))
 }
 
+fn note_tags<'a>(raw: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in raw.into_iter().filter_map(tag_from_scanner) {
+        if out.len() < MAX_TAGS && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// GitLab's schema allows a megabyte here. Note files cap out at 64 KiB.
+const MAX_DETAIL_CHARS: usize = 4000;
+
+fn capped(text: &str, max: usize) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &text[..i]),
+        None => text.to_string(),
+    }
+}
+
+/// GitLab security reports (SAST, secret detection, dependency scanning), schema 15.
+/// Dependency-scanning findings point at a manifest and package with no line and
+/// get rejected. Pre-15 reports name the scanner per vulnerability and call the
+/// title `message`.
+fn parse_gitlab(doc: &Value) -> Parsed {
+    let report_tool = str_at(doc, &["scan", "scanner", "name"])
+        .or_else(|| str_at(doc, &["scan", "analyzer", "name"]))
+        .unwrap_or("GitLab");
+    let mut out = Parsed {
+        ran: vec![report_tool.to_string()],
+        ..Parsed::default()
+    };
+    for (i, v) in doc["vulnerabilities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let tool = str_at(v, &["scanner", "name"])
+            .unwrap_or(report_tool)
+            .to_string();
+        if !out.tools.contains(&tool) {
+            out.tools.push(tool.clone());
+        }
+        if !out.ran.contains(&tool) {
+            out.ran.push(tool.clone());
+        }
+        // primary identifier comes first; that's the rule
+        let ids: Vec<&Value> = v["identifiers"].as_array().into_iter().flatten().collect();
+        let primary = ids.first();
+        let rule = primary
+            .and_then(|id| str_at(id, &["value"]).or_else(|| str_at(id, &["name"])))
+            .unwrap_or("");
+        let what = || format!("{tool} vulnerability {} ({rule})", i + 1);
+
+        let loc = &v["location"];
+        let Some(file) = str_at(loc, &["file"]) else {
+            out.rejected.push(format!("{}: no file location", what()));
+            continue;
+        };
+        let Some(start) = line(loc.get("start_line")) else {
+            out.rejected.push(match loc.get("dependency") {
+                Some(dep) => format!(
+                    "{}: dependency {} {} in {file} has no line to attach to",
+                    what(),
+                    str_at(dep, &["package", "name"]).unwrap_or("(unnamed)"),
+                    str_at(dep, &["version"]).unwrap_or("(no version)")
+                ),
+                None => format!("{}: {file} has no start line", what()),
+            });
+            continue;
+        };
+        let end = line(loc.get("end_line")).unwrap_or(start).max(start);
+
+        let title = str_at(v, &["name"])
+            .or_else(|| str_at(v, &["message"]))
+            .or_else(|| primary.and_then(|id| str_at(id, &["name"])))
+            .unwrap_or("Scanner finding");
+        let mut message = title.lines().next().unwrap_or_default().to_string();
+        if let Some(d) = str_at(v, &["description"]).filter(|d| !d.trim().is_empty()) {
+            message.push_str("\n\n");
+            message.push_str(&capped(d, MAX_DETAIL_CHARS));
+        }
+        if let Some(fix) = str_at(v, &["solution"]).filter(|d| !d.trim().is_empty()) {
+            message.push_str("\n\nSolution: ");
+            message.push_str(&capped(fix, MAX_DETAIL_CHARS));
+        }
+        for flag in v["flags"].as_array().into_iter().flatten() {
+            if str_at(flag, &["type"]) == Some("flagged-as-likely-false-positive") {
+                message.push_str(&format!(
+                    "\n\nFlagged as a likely false positive by {}: {}",
+                    str_at(flag, &["origin"]).unwrap_or("a scanner"),
+                    capped(
+                        str_at(flag, &["description"]).unwrap_or_default(),
+                        MAX_DETAIL_CHARS
+                    )
+                ));
+            }
+        }
+        let cwes: Vec<String> = ids
+            .iter()
+            .filter(|id| str_at(id, &["type"]).is_some_and(|t| t.eq_ignore_ascii_case("cwe")))
+            .filter_map(|id| str_at(id, &["value"])?.trim().parse::<u32>().ok())
+            .map(|n| format!("cwe-{n}"))
+            .collect();
+        let tags = note_tags(cwes.iter().map(String::as_str));
+        out.findings.push(RawFinding {
+            tool: tool.clone(),
+            uri: file.to_string(),
+            stripped: None,
+            start_line: start,
+            end_line: end,
+            rule: rule.to_string(),
+            message,
+            level: str_at(v, &["severity"]).map(str::to_string),
+            tags,
+            flow: Vec::new(),
+        });
+    }
+    out
+}
+
 fn parse_brakeman(doc: &Value) -> Parsed {
     let mut out = Parsed {
         tools: vec!["brakeman".into()],
+        ran: vec!["brakeman".into()],
         ..Parsed::default()
     };
     for w in doc["warnings"].as_array().into_iter().flatten() {
@@ -535,6 +803,8 @@ fn parse_brakeman(doc: &Value) -> Parsed {
             rule: str_at(w, &["check_name"]).unwrap_or("").to_string(),
             message,
             level: Some(level.into()),
+            tags: Vec::new(),
+            flow: Vec::new(),
         });
     }
     out
@@ -547,7 +817,7 @@ fn percent_decode(s: &str) -> Option<String> {
         .map(|c| c.into_owned())
 }
 
-/// Scanner uri → worktree-relative path. Only `file:` URIs and plain paths are accepted.
+/// `file:` URIs and plain paths only
 fn to_relative(store: &Store, uri: &str) -> Option<String> {
     if uri.starts_with("file:") {
         return store.relative(Path::new(&local_path(uri)?));
@@ -560,25 +830,19 @@ fn to_relative(store: &Store, uri: &str) -> Option<String> {
     safety::is_relative_safe(rel).then(|| rel.to_string())
 }
 
-/// The code at `start..=end` in the project file `rel`, or why there is none.
-fn read_snippet(store: &Store, rel: &str, start: u32, end: u32) -> Result<String, String> {
+fn read_snippet(store: &Store, rel: &str, start: u32, end: u32) -> Result<Code, String> {
     let path = safety::confine(store.root(), rel).map_err(|e| e.to_string())?;
     let text =
         safety::read_limited(&path, MAX_SOURCE_BYTES, rel).map_err(|e| format!("{rel}: {e:#}"))?;
-    let snippet = anchor::extract(&text, start, end);
-    if snippet.is_empty() {
-        return Err(format!("{rel}:{start}: line is past the end of the file"));
-    }
-    Ok(snippet)
+    anchor::code_at(&text, start, end)
+        .ok_or_else(|| format!("{rel}:{start}: line is past the end of the file"))
 }
 
-/// A finding resolved against the project: its confined path and current code.
 struct Located {
     f: RawFinding,
     rel: String,
-    snippet: String,
-    end_line: u32,
-    /// Fingerprint of the first occurrence; see [`anchor::fingerprint`].
+    code: Code,
+    /// occurrence-0 fingerprint, see [`anchor::fingerprint`]
     base: String,
 }
 
@@ -588,19 +852,75 @@ fn rule_key(rule: &str) -> &str {
     rule.rsplit(['.', '/']).next().unwrap_or_default()
 }
 
-pub fn ingest(store: &Store, config: &Config, parsed: Parsed) -> Summary {
+/// Reported, but the file couldn't be read (broken path, different checkout).
+/// The note may still be valid. Never auto-resolve it.
+struct Unlocated {
+    tool: String,
+    rule: String,
+    paths: Vec<String>,
+    name: String,
+}
+
+impl Unlocated {
+    /// Deliberately loose (file name alone is enough). Better a note left open
+    /// than one closed by mistake.
+    fn may_be(&self, note: &Note) -> bool {
+        let m = &note.meta;
+        m.source.as_deref() == Some(self.tool.as_str())
+            && rule_key(m.rule.as_deref().unwrap_or_default()) == self.rule
+            && (self.paths.contains(&m.file) || m.file.rsplit('/').next() == Some(&self.name))
+    }
+}
+
+/// Same tool and rule on a line where the note's code sits now. After an edit
+/// the fingerprint won't match, yet the finding is still there.
+fn still_reported(
+    store: &Store,
+    note: &Note,
+    reported: &HashMap<(String, String, String), Vec<u32>>,
+) -> bool {
+    let m = &note.meta;
+    let key = (
+        m.source.clone().unwrap_or_default(),
+        m.file.clone(),
+        rule_key(m.rule.as_deref().unwrap_or_default()).to_string(),
+    );
+    let Some(lines) = reported.get(&key) else {
+        return false;
+    };
+    let Ok(text) = store.read_source(&m.file) else {
+        return false;
+    };
+    let anchor = anchor::locate_in(&m.snippet, m.context(), m.start_line, m.end_line, &text);
+    let (start, end) = anchor.range();
+    !anchor.is_stale() && lines.iter().any(|l| (start..=end).contains(l))
+}
+
+pub fn ingest(
+    store: &Store,
+    config: &Config,
+    parsed: Parsed,
+    options: Options,
+) -> anyhow::Result<Summary> {
+    let resolved_status = match options.resolve_missing {
+        true => Some(config.resolved_status().context(
+            "--resolve-missing needs `resolved_status` in config.toml: there is no `ok` status \
+             to use",
+        )?),
+        false => None,
+    };
     let mut summary = Summary {
         tools: parsed.tools,
         ignored: parsed.ignored,
         rejected: parsed.rejected,
         ..Summary::default()
     };
+    let mut unlocated = Vec::new();
     let mut located = Vec::new();
     for f in parsed.findings {
         if !summary.tools.contains(&f.tool) {
             summary.tools.push(f.tool.clone());
         }
-        // The path as given, then relative to a root the report names.
         let mut candidates: Vec<String> = Vec::new();
         for rel in [Some(f.uri.as_str()), f.stripped.as_deref()]
             .into_iter()
@@ -611,7 +931,15 @@ pub fn ingest(store: &Store, config: &Config, parsed: Parsed) -> Summary {
                 candidates.push(rel);
             }
         }
+        let name = f.uri.rsplit('/').next().and_then(percent_decode);
+        let unlocated_here = |paths: Vec<String>| Unlocated {
+            tool: f.tool.clone(),
+            rule: rule_key(&f.rule).to_string(),
+            paths,
+            name: name.clone().unwrap_or_default(),
+        };
         if candidates.is_empty() {
+            unlocated.push(unlocated_here(Vec::new()));
             summary.rejected.push(format!(
                 "{}: path outside the project or unsupported uri",
                 f.uri
@@ -620,10 +948,10 @@ pub fn ingest(store: &Store, config: &Config, parsed: Parsed) -> Summary {
         }
         let mut first_error = None;
         let mut found = None;
-        for rel in candidates {
-            match read_snippet(store, &rel, f.start_line, f.end_line) {
-                Ok(snippet) => {
-                    found = Some((rel, snippet));
+        for rel in &candidates {
+            match read_snippet(store, rel, f.start_line, f.end_line) {
+                Ok(code) => {
+                    found = Some((rel.clone(), code));
                     break;
                 }
                 Err(e) => {
@@ -631,24 +959,18 @@ pub fn ingest(store: &Store, config: &Config, parsed: Parsed) -> Summary {
                 }
             }
         }
-        let Some((rel, snippet)) = found else {
+        let Some((rel, code)) = found else {
+            unlocated.push(unlocated_here(candidates));
             summary.rejected.extend(first_error);
             continue;
         };
-        let end_line = f.start_line + snippet.lines().count().max(1) as u32 - 1;
-        let base = anchor::fingerprint(&rel, rule_key(&f.rule), &snippet, 0);
-        located.push(Located {
-            f,
-            rel,
-            snippet,
-            end_line,
-            base,
-        });
+        let base = anchor::fingerprint(&rel, rule_key(&f.rule), &code.snippet, 0);
+        located.push(Located { f, rel, code, base });
     }
 
-    // In line order, so the same rule on identical code twice in a file gets
-    // occurrence 0, 1, ... the same way on every import. A scanner reporting
-    // the very same line twice is one finding.
+    // Line order keeps occurrence numbers (0, 1, ...) stable across imports when
+    // one rule hits identical code twice in a file. Same line reported twice
+    // counts once.
     located
         .sort_by(|a, b| (&a.rel, a.f.start_line, &a.base).cmp(&(&b.rel, b.f.start_line, &b.base)));
     let before = located.len();
@@ -663,37 +985,43 @@ pub fn ingest(store: &Store, config: &Config, parsed: Parsed) -> Summary {
     let mut occurrences: HashMap<String, usize> = HashMap::new();
     let now = Utc::now().trunc_subsecs(0);
     let status = config.import_status().to_string();
+    let mut present: HashSet<String> = HashSet::new();
+    let mut reported: HashMap<(String, String, String), Vec<u32>> = HashMap::new();
 
-    for Located {
-        f,
-        rel,
-        snippet,
-        end_line,
-        base,
-    } in located
-    {
+    for Located { f, rel, code, base } in located {
+        reported
+            .entry((f.tool.clone(), rel.clone(), rule_key(&f.rule).to_string()))
+            .or_default()
+            .push(f.start_line);
         let n = occurrences.entry(base).or_default();
-        let fp = anchor::fingerprint(&rel, rule_key(&f.rule), &snippet, *n);
+        let fp = anchor::fingerprint(&rel, rule_key(&f.rule), &code.snippet, *n);
         *n += 1;
+        present.insert(fp.clone());
         if !seen.insert(fp.clone()) {
             summary.skipped += 1;
             continue;
         }
 
+        let mut meta = Meta {
+            id: store.new_id(&fp),
+            file: rel,
+            start_line: f.start_line,
+            end_line: f.start_line,
+            status: status.clone(),
+            author: f.tool.clone(),
+            created: now,
+            source: Some(f.tool.clone()),
+            rule: (!f.rule.is_empty()).then(|| f.rule.clone()),
+            tags: f.tags.clone(),
+            fingerprint: Some(fp),
+            snippet: String::new(),
+            context_before: None,
+            context_after: None,
+            extra: Default::default(),
+        };
+        meta.set(f.start_line, code);
         let note = Note {
-            meta: Meta {
-                id: store.new_id(&fp),
-                file: rel,
-                start_line: f.start_line,
-                end_line,
-                status: status.clone(),
-                author: f.tool.clone(),
-                created: now,
-                source: Some(f.tool.clone()),
-                rule: (!f.rule.is_empty()).then(|| f.rule.clone()),
-                fingerprint: Some(fp),
-                snippet,
-            },
+            meta,
             body: imported_body(&f),
         };
         match store.save(&note) {
@@ -701,7 +1029,42 @@ pub fn ingest(store: &Store, config: &Config, parsed: Parsed) -> Summary {
             Err(e) => summary.rejected.push(format!("saving note: {e:#}")),
         }
     }
-    summary
+
+    if let Some(status) = resolved_status {
+        let mut resolved = Vec::new();
+        for mut note in store.load_all().0 {
+            let m = &note.meta;
+            // this report's tools only, never hand-written notes
+            let (Some(source), Some(fp)) = (m.source.clone(), &m.fingerprint) else {
+                continue;
+            };
+            if !parsed.ran.contains(&source)
+                || present.contains(fp)
+                || m.status == status
+                || unlocated.iter().any(|u| u.may_be(&note))
+                || still_reported(store, &note, &reported)
+            {
+                continue;
+            }
+            note.meta.status = status.to_string();
+            note.history(&format!("Not reported by {}", md_escape(&source)));
+            let m = &note.meta;
+            match store.save(&note) {
+                Ok(_) => resolved.push(format!(
+                    "{} {}:{} {}",
+                    m.id,
+                    m.file,
+                    m.start_line,
+                    note.plain_title()
+                )),
+                Err(e) => summary
+                    .rejected
+                    .push(format!("saving note {}: {e:#}", m.id)),
+            }
+        }
+        summary.resolved = Some(resolved);
+    }
+    Ok(summary)
 }
 
 fn imported_body(f: &RawFinding) -> String {
@@ -712,6 +1075,21 @@ fn imported_body(f: &RawFinding) -> String {
     if !rest.trim().is_empty() {
         body.push_str(&md_escape(rest.trim()));
         body.push_str("\n\n");
+    }
+    if !f.flow.is_empty() {
+        body.push_str("Data flow:\n\n");
+        for (i, step) in f.flow.iter().take(MAX_FLOW_STEPS).enumerate() {
+            // code span, so a report path can't become a link
+            body.push_str(&format!("{}. {}", i + 1, inline_code(&step.location)));
+            if let Some(m) = &step.message {
+                body.push_str(&format!(" — {}", md_escape(m)));
+            }
+            body.push('\n');
+        }
+        if let Some(more) = f.flow.len().checked_sub(MAX_FLOW_STEPS).filter(|&n| n > 0) {
+            body.push_str(&format!("\n_{more} more steps not shown._\n"));
+        }
+        body.push('\n');
     }
     body.push_str(&format!("Imported from {}", md_escape(&f.tool)));
     if !f.rule.is_empty() {
@@ -748,6 +1126,37 @@ mod tests {
             "results":[{{"ruleId":"sqli","level":"error","message":{{"text":"SQL built with f-string ](http://evil)"}},
             "locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"{uri}"}},"region":{{"startLine":3,"endLine":4}}}}}}]}}]}}]}}"#
         )
+    }
+
+    #[test]
+    fn recognises_reports_only() {
+        for (text, want) in [
+            (r#"{"version": "2.1.0", "runs": []}"#, true),
+            (r#"{"scan_info": {}, "warnings": [{"x": 1}]}"#, true),
+            (r#"{"name": "app", "dependencies": {}}"#, false),
+            (r#"{"runs": "nope"}"#, false),
+            (r#"{"warnings": null}"#, false),
+            (
+                r#"{"version": "15.2.5", "scan": {"type": "sast"}, "vulnerabilities": []}"#,
+                true,
+            ),
+            (r#"{"vulnerabilities": []}"#, false),
+            // npm audit: vulnerabilities by package name.
+            (
+                r#"{"auditReportVersion": 2, "vulnerabilities": {}, "scan": {}}"#,
+                false,
+            ),
+            (r#"{"vulnerabilities": [], "scan": []}"#, false),
+            (r#"{"runs": [], "warnings": 3}"#, true),
+            (r#"{"warnings": [], "runs": "x"}"#, true),
+            (r#"[[1], [2], [3], {}]"#, false),
+            (r#""runs""#, false),
+            ("[1, 2]", false),
+            ("not json", false),
+        ] {
+            assert_eq!(is_report(text), want, "{text}");
+            assert_eq!(parse(text).is_ok(), want, "{text}");
+        }
     }
 
     #[test]
@@ -838,7 +1247,7 @@ mod tests {
                 r#"{{"ruleId":"eval","message":{{"text":"eval"}},"locations":[{{"physicalLocation":{{"artifactLocation":{{"uri":"app/e.py"}},"region":{{"startLine":{line}}}}}}}]}}"#
             )
         };
-        // The last result repeats the first: a scanner listing a line twice.
+        // last result repeats the first
         let doc = format!(
             r#"{{"runs":[{{"tool":{{"driver":{{"name":"t"}}}},"results":[{},{},{}]}}]}}"#,
             result(3),
@@ -904,7 +1313,7 @@ mod tests {
         assert_eq!(resolve_uri(&run, "f.py", Some("NONE")), "f.py");
         assert_eq!(resolve_uri(&run, "f.py", Some("MISSING")), "f.py");
         assert_eq!(resolve_uri(&run, "/abs/f.py", Some("A")), "/abs/f.py");
-        // Terminates; how far it got does not matter.
+        // only needs to terminate
         assert!(resolve_uri(&run, "f.py", Some("X")).ends_with("f.py"));
         assert_eq!(report_roots(&run)[0], "/r/sub/");
     }
@@ -961,7 +1370,7 @@ mod tests {
             id(r#"{"rule":{"index":0,"toolComponent":{"guid":"g1"}}}"#).as_deref(),
             Some("e0")
         );
-        // An index into the wrong list is caught by the id, which is then searched for.
+        // index into the wrong list; id mismatch, falls back to id lookup
         assert_eq!(
             id(r#"{"ruleId":"e0","ruleIndex":0}"#).as_deref(),
             Some("e0")
@@ -1071,7 +1480,7 @@ mod tests {
             uri(json!({"uri":"a.py","index":0})).as_deref(),
             Some("sub/a.py")
         );
-        // A different file than the artifact: the artifact's base says nothing about it.
+        // not the artifact's file, its base doesn't apply
         assert_eq!(
             uri(json!({"uri":"b.py","index":0})).as_deref(),
             Some("b.py")
@@ -1110,6 +1519,317 @@ mod tests {
         let uri = resolve_uri(&run, "f.py", Some("B19"));
         assert!(uri.starts_with("file:///r/d1/d2/"), "{uri}");
         assert!(uri.ends_with("/d19/f.py"), "{uri}");
+    }
+
+    fn gitlab(vulnerabilities: Value) -> String {
+        json!({
+            "version": "15.2.5",
+            "scan": {"type": "sast", "scanner": {"id": "s", "name": "Semgrep"}},
+            "vulnerabilities": vulnerabilities,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn gitlab_vulnerabilities() {
+        let doc = gitlab(json!([
+            {"id": "1", "name": "SQL injection [x](http://evil)", "description": "Long\ntext",
+             "severity": "High",
+             "identifiers": [
+                {"type": "semgrep_id", "name": "SQL rule", "value": "python_sql_rule-x"},
+                {"type": "cwe", "name": "CWE-89", "value": "89"},
+                {"type": "CWE", "name": "CWE-20", "value": " 20 "},
+                {"type": "cwe", "name": "bad", "value": "89](http://evil)"},
+                {"type": "owasp", "name": "A03:2021 - Injection", "value": "A03:2021"}],
+             "location": {"file": "app/users.py", "start_line": 3, "end_line": 4}},
+            {"id": "2", "message": "Older reports: message, scanner per finding",
+             "scanner": {"id": "old", "name": "Old Tool"},
+             "identifiers": [{"type": "x", "name": "Rule name", "value": "r"}],
+             "location": {"file": "app/users.py", "start_line": 4}},
+            {"id": "3", "name": "Django", "identifiers": [{"type": "cve", "name": "CVE-1", "value": "CVE-1"}],
+             "location": {"file": "requirements.txt",
+                          "dependency": {"package": {"name": "Django"}, "version": "3.2.0"}}},
+            {"id": "4", "name": "No line", "identifiers": [{"type": "x", "name": "n", "value": "n"}],
+             "location": {"file": "app/users.py"}},
+            {"id": "5", "name": "No file", "identifiers": [{"type": "x", "name": "n", "value": "n"}],
+             "location": {}}
+        ]));
+        let p = parse(&doc).unwrap();
+        assert_eq!(p.tools, ["Semgrep", "Old Tool"]);
+        let f = &p.findings;
+        assert_eq!(f.len(), 2);
+        assert_eq!((f[0].start_line, f[0].end_line), (3, 4));
+        assert_eq!(f[0].rule, "python_sql_rule-x");
+        assert_eq!(f[0].level.as_deref(), Some("High"));
+        assert_eq!(f[0].tags, ["cwe-89", "cwe-20"]);
+        assert!(
+            f[0].message
+                .starts_with("SQL injection [x](http://evil)\n\nLong\ntext")
+        );
+        assert_eq!((f[1].tool.as_str(), f[1].end_line), ("Old Tool", 4));
+        assert!(f[1].message.starts_with("Older reports"));
+        assert_eq!(p.rejected.len(), 3, "{:?}", p.rejected);
+        assert!(
+            p.rejected[0].contains("dependency Django 3.2.0 in requirements.txt has no line"),
+            "{:?}",
+            p.rejected
+        );
+        assert!(p.rejected[1].ends_with("app/users.py has no start line"));
+        assert!(p.rejected[2].ends_with("no file location"));
+
+        let (_d, store) = project();
+        let s = import_text(&store, &Config::default(), &doc).unwrap();
+        assert_eq!((s.imported, s.rejected.len()), (2, 3), "{s}");
+        let note = store
+            .load_all()
+            .0
+            .into_iter()
+            .find(|n| n.meta.start_line == 3)
+            .unwrap();
+        assert!(
+            note.body
+                .starts_with(r"# SQL injection \[x\]\(http://evil\)"),
+            "{}",
+            note.body
+        );
+        assert!(note.body.contains("level High."), "{}", note.body);
+    }
+
+    #[test]
+    fn gitlab_paths_are_confined() {
+        let (_d, store) = project();
+        for file in [
+            "../../../etc/passwd",
+            "/etc/passwd",
+            "file:///etc/passwd",
+            "app/../../x.py",
+        ] {
+            let doc = gitlab(json!([{"id": "1", "name": "x",
+                "identifiers": [{"type": "x", "name": "n", "value": "n"}],
+                "location": {"file": file, "start_line": 1}}]));
+            let s = import_text(&store, &Config::default(), &doc).unwrap();
+            assert_eq!((s.imported, s.rejected.len()), (0, 1), "{file}");
+        }
+        assert!(store.load_all().0.is_empty());
+    }
+
+    #[test]
+    fn long_details_are_capped() {
+        let long = "é".repeat(MAX_DETAIL_CHARS + 10);
+        let capped = capped(&long, MAX_DETAIL_CHARS);
+        assert_eq!(capped.chars().count(), MAX_DETAIL_CHARS + 1);
+        assert!(capped.ends_with('…'));
+        assert_eq!(super::capped(" short ", 10), "short");
+    }
+
+    fn report(tool: &str, results: &[(&str, &str, u32)]) -> String {
+        let results: Vec<Value> = results
+            .iter()
+            .map(|(rule, uri, line)| {
+                json!({"ruleId": rule, "message": {"text": format!("{rule} here")},
+                       "locations": [{"physicalLocation": {"artifactLocation": {"uri": uri},
+                                                           "region": {"startLine": line}}}]})
+            })
+            .collect();
+        json!({"runs": [{"tool": {"driver": {"name": tool}}, "results": results}]}).to_string()
+    }
+
+    #[test]
+    fn resolve_missing() {
+        let (_d, store) = project();
+        let config = Config::default();
+        let resolve = Options {
+            resolve_missing: true,
+        };
+        let import = |doc: &str, options| import_text_with(&store, &config, doc, options).unwrap();
+        let all = [
+            ("sqli", "app/users.py", 4),
+            ("def", "app/users.py", 3),
+            ("imp", "app/users.py", 1),
+        ];
+        import(&report("t", &all), Options::default());
+        import(
+            &report("other", &[("sqli", "app/users.py", 3)]),
+            Options::default(),
+        );
+        let text = fs::read_to_string(store.root().join("app/users.py")).unwrap();
+        let by_hand = Note::new_on(
+            store.new_id("h"),
+            "app/users.py".into(),
+            &text,
+            4,
+            4,
+            "note",
+            "me".into(),
+            "# Mine".into(),
+        )
+        .unwrap();
+        store.save(&by_hand).unwrap();
+        let notes = || store.load_all().0;
+        let find = |tool: &str, rule: &str| {
+            notes()
+                .into_iter()
+                .find(|n| {
+                    n.meta.source.as_deref() == Some(tool) && n.meta.rule.as_deref() == Some(rule)
+                })
+                .unwrap()
+        };
+        // already OK, no history line
+        let mut ok = find("t", "imp");
+        ok.meta.status = "ok".into();
+        store.save(&ok).unwrap();
+
+        // no option, nothing resolved
+        let s = import(&report("t", &all[..1]), Options::default());
+        assert_eq!(s.resolved, None);
+        assert!(!s.to_string().contains("resolved"));
+        assert!(
+            notes()
+                .iter()
+                .all(|n| n.meta.status != "ok" || n.meta.id == ok.meta.id)
+        );
+
+        // `def` is gone. `sqli` has a broken path now but might still exist; keep it.
+        let s = import(
+            &report(
+                "t",
+                &[("sqli", "elsewhere/users.py", 4), ("x", "app/users.py", 9)],
+            ),
+            resolve,
+        );
+        assert_eq!(s.resolved.as_ref().map(Vec::len), Some(1), "{s}");
+        assert!(
+            s.to_string().ends_with(", resolved 1 (no longer reported)"),
+            "{s}"
+        );
+        assert_eq!(s.rejected.len(), 2, "{:?}", s.rejected);
+        let def = find("t", "def");
+        assert_eq!(def.meta.status, "ok");
+        assert!(
+            def.body.ends_with(&format!(
+                "_Not reported by t on {}._",
+                Utc::now().format("%Y-%m-%d")
+            )),
+            "{}",
+            def.body
+        );
+        assert_eq!(find("t", "sqli").meta.status, "open");
+        assert_eq!(find("t", "imp"), ok);
+        assert_eq!(find("other", "sqli").meta.status, "open");
+        let mine = store.load(&by_hand.meta.id).unwrap();
+        assert_eq!(mine, by_hand);
+
+        // A clean scan resolves the rest of that tool's findings.
+        let s = import(&report("t", &[]), resolve);
+        assert_eq!(s.resolved.as_ref().map(Vec::len), Some(1), "{s}");
+        assert_eq!(find("t", "sqli").meta.status, "ok");
+        assert_eq!(find("other", "sqli").meta.status, "open");
+        assert_eq!(store.load(&by_hand.meta.id).unwrap(), by_hand);
+        // idempotent
+        let s = import(&report("t", &[]), resolve);
+        assert_eq!(s.resolved, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resolve_missing_keeps_a_finding_on_edited_code() {
+        let (dir, store) = project();
+        let config = Config::default();
+        let resolve = Options {
+            resolve_missing: true,
+        };
+        import_text(
+            &store,
+            &config,
+            &report("t", &[("sqli", "app/users.py", 4)]),
+        )
+        .unwrap();
+        let mut triaged = store.load_all().0.remove(0);
+        triaged.mark("issue", "Issue", "me");
+        store.save(&triaged).unwrap();
+        // The flagged line is edited; the scanner still flags it.
+        let path = dir.path().join("app/users.py");
+        let text = fs::read_to_string(&path).unwrap().replace("{id}", "{uid}");
+        fs::write(&path, text).unwrap();
+        // Another rule on that line is not this finding.
+        let other = report("t", &[("other", "app/users.py", 4)]);
+        let s = import_text_with(&store, &config, &other, resolve).unwrap();
+        assert_eq!(s.resolved.as_ref().map(Vec::len), Some(1), "{s}");
+        store.save(&triaged).unwrap();
+        let s = import_text_with(
+            &store,
+            &config,
+            &report("t", &[("sqli", "app/users.py", 4)]),
+            resolve,
+        )
+        .unwrap();
+        // Only the `other` finding from the step before is resolved.
+        let resolved = s.resolved.unwrap();
+        assert!(
+            resolved.len() == 1 && resolved[0].ends_with("other here"),
+            "{resolved:?}"
+        );
+        assert_eq!(store.load(&triaged.meta.id).unwrap(), triaged);
+    }
+
+    #[test]
+    fn resolve_missing_needs_a_status() {
+        let (_d, store) = project();
+        let config: Config =
+            toml::from_str("[[status]]\nid = \"todo\"\nlabel = \"TODO\"\nseverity = \"warning\"\n")
+                .unwrap();
+        let options = Options {
+            resolve_missing: true,
+        };
+        let err = import_text_with(&store, &config, &report("t", &[]), options).unwrap_err();
+        assert!(err.to_string().contains("resolved_status"), "{err}");
+    }
+
+    #[test]
+    fn data_flow_is_listed_escaped_and_capped() {
+        let (_d, store) = project();
+        let step = |uri: &str, line: u32, text: &str| {
+            json!({"location": {"physicalLocation": {"artifactLocation": {"uri": uri}, "region": {"startLine": line}},
+                                "message": {"text": text}}})
+        };
+        let mut steps = vec![
+            step(
+                "[x](http://evil)",
+                1,
+                "**user** input [here](http://evil) <b>",
+            ),
+            step("a`b`.py", 2, "multi\nline   text"),
+            step("file:///ci/work/proj/app/users.py", 3, "[the value](0)"),
+            json!({"location": {"message": {"text": "nowhere"}}}),
+        ];
+        steps.extend((0..19).map(|i| step("app/users.py", 4, &format!("step {i}"))));
+        let doc = json!({"runs": [{"tool": {"driver": {"name": "t"}},
+            "originalUriBaseIds": {"SRC": {"uri": "file:///ci/work/proj/"}},
+            "results": [{"ruleId": "sqli", "message": {"text": "SQL"},
+                "locations": [{"physicalLocation": {"artifactLocation": {"uri": "app/users.py"}, "region": {"startLine": 4}}}],
+                "codeFlows": [{"threadFlows": [{"locations": steps}, {"locations": [step("second.py", 1, "ignored")]}]},
+                              {"threadFlows": [{"locations": [step("other.py", 1, "ignored")]}]}]}]}]});
+        let s = import_text(&store, &Config::default(), &doc.to_string()).unwrap();
+        assert_eq!(s.imported, 1, "{s}");
+        let body = &store.load_all().0[0].body;
+        assert!(
+            body.contains(
+                "Data flow:\n\n\
+                 1. `[x](http://evil):1` — \\*\\*user\\*\\* input \\[here\\]\\(http://evil\\) \\<b\\>\n\
+                 2. ``a`b`.py:2`` — multi line text\n\
+                 3. `app/users.py:3` — the value\n\
+                 4. `(no location)` — nowhere\n"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("\n20. `app/users.py:4` — step 15\n\n_3 more steps not shown._\n"),
+            "{body}"
+        );
+        assert!(
+            !body.contains("step 16") && !body.contains("ignored"),
+            "{body}"
+        );
+        assert!(body.ends_with("Imported from t, rule `sqli`."), "{body}");
     }
 
     #[test]

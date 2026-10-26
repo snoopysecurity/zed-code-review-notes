@@ -1,0 +1,144 @@
+{
+  "version": "15.2.5",
+  "schema": "https://gitlab.com/gitlab-org/security-products/security-report-schemas/-/raw/v15.2.5/dist/sast-report-format.json",
+  "vulnerabilities": [
+    {
+      "id": "8b2a4c0e-6f1d-4c1a-9a51-2f0d8f6b7e01",
+      "name": "Improper neutralization of special elements used in an SQL Command ('SQL Injection')",
+      "description": "SQL Injection is a critical vulnerability that can lead to data or system compromise. By\ndynamically generating SQL query strings, user input may be able to influence the logic of\nthe SQL statement.",
+      "solution": "Use parameterized queries: `cursor.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,))`.",
+      "severity": "High",
+      "identifiers": [
+        {
+          "type": "semgrep_id",
+          "name": "python_sql_rule-hardcoded-sql-expression",
+          "value": "python_sql_rule-hardcoded-sql-expression",
+          "url": "https://semgrep.dev/r/gitlab.python_sql_rule-hardcoded-sql-expression"
+        },
+        {
+          "type": "cwe",
+          "name": "CWE-89",
+          "value": "89",
+          "url": "https://cwe.mitre.org/data/definitions/89.html"
+        },
+        {
+          "type": "owasp",
+          "name": "A03:2021 - Injection",
+          "value": "A03:2021"
+        },
+        {
+          "type": "bandit_test_id",
+          "name": "Bandit Test ID B608",
+          "value": "B608"
+        }
+      ],
+      "location": {
+        "file": "app/users.py",
+        "start_line": 9,
+        "end_line": 9
+      },
+      "tracking": {
+        "type": "source",
+        "items": [
+          {
+            "file": "app/users.py",
+            "start_line": 9,
+            "end_line": 9,
+            "signatures": [
+              {
+                "algorithm": "scope_offset",
+                "value": "app/users.py|show[0]:2"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "1f6c2d77-0b9e-4e43-8a3c-5d6e7f809a12",
+      "name": "Improper neutralization of special elements used in an OS Command ('OS Command Injection')",
+      "description": "Starting a process with a shell, `shell=True`, lets characters in `host` such as `;` and `|` run further commands.",
+      "severity": "High",
+      "identifiers": [
+        {
+          "type": "semgrep_id",
+          "name": "python_exec_rule-subprocess-call-shell-true",
+          "value": "python_exec_rule-subprocess-call-shell-true",
+          "url": "https://semgrep.dev/r/gitlab.python_exec_rule-subprocess-call-shell-true"
+        },
+        {
+          "type": "cwe",
+          "name": "CWE-78",
+          "value": "78",
+          "url": "https://cwe.mitre.org/data/definitions/78.html"
+        },
+        {
+          "type": "bandit_test_id",
+          "name": "Bandit Test ID B602",
+          "value": "B602"
+        }
+      ],
+      "location": {
+        "file": "app/users.py",
+        "start_line": 14,
+        "end_line": 14
+      },
+      "flags": [
+        {
+          "type": "flagged-as-likely-false-positive",
+          "origin": "vet",
+          "description": "The argument is a fixed string followed by a hostname"
+        }
+      ]
+    },
+    {
+      "id": "c3d9e0f1-2a4b-4c5d-8e6f-7a8b9c0d1e23",
+      "name": "URL redirection to untrusted site ('Open Redirect')",
+      "description": "The application redirects to a URL taken from the request without validating it.",
+      "severity": "Medium",
+      "identifiers": [
+        {
+          "type": "semgrep_id",
+          "name": "ruby_redirect_rule-CheckRedirect",
+          "value": "ruby_redirect_rule-CheckRedirect"
+        },
+        {
+          "type": "cwe",
+          "name": "CWE-601",
+          "value": "601",
+          "url": "https://cwe.mitre.org/data/definitions/601.html"
+        }
+      ],
+      "location": {
+        "file": "app/controllers/users_controller.rb",
+        "start_line": 7,
+        "class": "UsersController",
+        "method": "redirect"
+      }
+    }
+  ],
+  "scan": {
+    "analyzer": {
+      "id": "semgrep",
+      "name": "Semgrep",
+      "url": "https://gitlab.com/gitlab-org/security-products/analyzers/semgrep",
+      "vendor": {
+        "name": "GitLab"
+      },
+      "version": "5.21.0"
+    },
+    "scanner": {
+      "id": "semgrep",
+      "name": "Semgrep",
+      "url": "https://github.com/returntocorp/semgrep",
+      "vendor": {
+        "name": "GitLab"
+      },
+      "version": "1.86.0"
+    },
+    "type": "sast",
+    "start_time": "2026-10-14T09:12:03",
+    "end_time": "2026-10-14T09:12:41",
+    "status": "success"
+  }
+}

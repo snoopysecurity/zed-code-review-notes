@@ -1,8 +1,6 @@
-//! Path confinement and size limits.
-//!
-//! Note files and scanner reports come from the repository under review, which
-//! may be hostile. Every path taken from them goes through [`confine`] before it
-//! touches the filesystem, and every read goes through [`read_limited`].
+//! Path confinement and size limits. Note files and scanner reports come from
+//! the repo under review, which may be hostile. Any path from them goes through
+//! [`confine`] before touching the filesystem, and reads go through [`read_limited`].
 
 use std::fmt;
 use std::fs;
@@ -35,7 +33,7 @@ impl fmt::Display for SafetyError {
 
 impl std::error::Error for SafetyError {}
 
-/// Lexical checks only: no filesystem access. Accepts a worktree-relative POSIX path.
+/// Lexical only, no filesystem access. Expects a worktree-relative POSIX path
 pub fn is_relative_safe(candidate: &str) -> bool {
     if candidate.is_empty() || candidate.contains('\0') || candidate.contains('\\') {
         return false;
@@ -48,7 +46,7 @@ pub fn is_relative_safe(candidate: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// `http:`, `data:`, `C:` and friends: anything that looks like `<letters>:` up front.
+/// Anything shaped like `<letters>:` up front (`http:`, `data:`, `C:`, ...)
 pub(crate) fn has_scheme_or_drive(s: &str) -> bool {
     let Some(colon) = s.find(':') else {
         return false;
@@ -61,8 +59,8 @@ pub(crate) fn has_scheme_or_drive(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
-/// The local path a `file:` uri names, decoded: `file:///abs`, `file:/abs` or
-/// `file://localhost/abs` (RFC 8089). Other hosts are not local files.
+/// Decoded local path for `file:///abs`, `file:/abs` or `file://localhost/abs`
+/// (RFC 8089). Any other host isn't a local file.
 pub(crate) fn file_uri_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file:")?;
     let path = match rest.strip_prefix("//") {
@@ -84,8 +82,8 @@ pub(crate) fn file_uri_path(uri: &str) -> Option<PathBuf> {
         .then(|| PathBuf::from(decoded.as_ref()))
 }
 
-/// Resolve a worktree-relative path to an absolute one, refusing anything that
-/// leaves `root` — lexically (`..`, absolute, scheme) or through a symlink.
+/// Worktree-relative path to absolute. Refuses anything that leaves `root`,
+/// lexically (`..`, absolute, scheme) or via a symlink.
 pub fn confine(root: &Path, candidate: &str) -> Result<PathBuf, SafetyError> {
     let escape = || SafetyError::PathEscape {
         candidate: candidate.to_string(),
@@ -96,7 +94,7 @@ pub fn confine(root: &Path, candidate: &str) -> Result<PathBuf, SafetyError> {
     let root = fs::canonicalize(root).map_err(|_| escape())?;
     let joined = root.join(candidate);
 
-    // The leaf may not exist yet, so canonicalize the deepest ancestor that does.
+    // leaf may not exist yet; canonicalize the deepest ancestor that does
     let mut existing = joined.as_path();
     let mut rest = Vec::new();
     while !existing.exists() {
@@ -113,7 +111,7 @@ pub fn confine(root: &Path, candidate: &str) -> Result<PathBuf, SafetyError> {
     Ok(resolved)
 }
 
-/// Read a file as UTF-8 (lossily), refusing anything over `limit` before reading it.
+/// UTF-8 (lossy) read. Checks size against `limit` before reading anything
 pub fn read_limited(path: &Path, limit: u64, what: &str) -> anyhow::Result<String> {
     let len = fs::metadata(path)?.len();
     if len > limit {

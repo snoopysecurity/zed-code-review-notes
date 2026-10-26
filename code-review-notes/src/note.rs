@@ -1,22 +1,26 @@
-//! A review note: TOML front matter between `+++` lines, then a Markdown body.
+//! A review note: TOML front matter between `+++` lines, Markdown body after.
 
 use anyhow::{Context, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::anchor;
 use crate::config::is_valid_status_id;
+use crate::markdown::md_escape;
 use crate::safety;
 
+/// Unknown fields land in [`Meta::extra`] and get written back untouched. Notes
+/// travel through git and a teammate on a newer version may add fields we've
+/// never heard of.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct Meta {
     pub id: String,
-    /// Worktree-relative POSIX path.
+    /// worktree-relative, POSIX
     pub file: String,
-    /// 1-based, inclusive.
+    /// 1-based, inclusive
     pub start_line: u32,
     pub end_line: u32,
-    /// One of the ids in `config.toml`, e.g. `open`.
+    /// a status id from `config.toml`, e.g. `open`
     pub status: String,
     pub author: String,
     pub created: DateTime<Utc>,
@@ -24,10 +28,48 @@ pub struct Meta {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
+    /// Plain labels like `cwe-89`, see [`is_valid_tag`]. Older versions keep
+    /// them in `extra`, which keeps notes readable there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub snippet: String,
+    /// Nearest non-blank line around the code (see [`anchor::Context`]).
+    /// Absent in notes written before we recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_after: Option<String>,
+    #[serde(flatten)]
+    pub extra: toml::Table,
+}
+
+impl Meta {
+    /// Point the note at lines `start..=end` of `text`. The end gets cut at the
+    /// snippet line limit; errors if `start` is past EOF.
+    pub fn set_code(&mut self, text: &str, start: u32, end: u32) -> anyhow::Result<()> {
+        let code = anchor::code_at(text, start, end)
+            .with_context(|| format!("line {start} is past the end of the file"))?;
+        self.set(start, code);
+        Ok(())
+    }
+
+    pub fn set(&mut self, start: u32, code: anchor::Code) {
+        self.start_line = start;
+        self.end_line = code.end_line;
+        self.snippet = code.snippet;
+        self.context_before = code.context_before;
+        self.context_after = code.context_after;
+    }
+
+    pub fn context(&self) -> anchor::Context<'_> {
+        anchor::Context {
+            before: self.context_before.as_deref(),
+            after: self.context_after.as_deref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,16 +80,85 @@ pub struct Note {
 
 const FENCE: &str = "+++";
 
+/// Initial title for notes added in the editor (selected so you can type over it)
+pub const PLACEHOLDER_TITLE: &str = "New review note";
+
 impl Note {
+    /// `rel` is the project-relative path `text` was read from
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_on(
+        id: String,
+        rel: String,
+        text: &str,
+        start: u32,
+        end: u32,
+        status: &str,
+        author: String,
+        body: String,
+    ) -> anyhow::Result<Note> {
+        anyhow::ensure!(start >= 1, "lines are numbered from 1");
+        anyhow::ensure!(start <= end, "start line {start} is after end line {end}");
+        let mut meta = Meta {
+            id,
+            file: rel,
+            start_line: start,
+            end_line: end,
+            status: status.to_string(),
+            author,
+            created: Utc::now().trunc_subsecs(0),
+            source: None,
+            rule: None,
+            tags: Vec::new(),
+            fingerprint: None,
+            snippet: String::new(),
+            context_before: None,
+            context_after: None,
+            extra: Default::default(),
+        };
+        meta.set_code(text, start, end)?;
+        Ok(Note { meta, body })
+    }
+
+    /// Also logs who changed it in the body's history
+    pub fn mark(&mut self, status: &str, label: &str, author: &str) {
+        self.meta.status = status.to_string();
+        self.history(&format!(
+            "{} marked this {}",
+            md_escape(author),
+            md_escape(label)
+        ));
+    }
+
+    /// Appends `_<what> on <date>._` to the body
+    pub fn history(&mut self, what: &str) {
+        self.body.push_str(&format!(
+            "\n\n_{what} on {}._",
+            Utc::now().format("%Y-%m-%d")
+        ));
+    }
+
+    /// Line plus start/end columns (UTF-16) of the title in [`Note::render`]'s
+    /// output, used to select it in the editor
+    pub fn title_position(&self) -> Option<(u32, u32, u32)> {
+        let title = self.title();
+        self.render().lines().enumerate().find_map(|(i, l)| {
+            let at = l
+                .find(title)
+                .filter(|_| l.trim_start_matches('#').trim() == title)?;
+            let start = l[..at].encode_utf16().count() as u32;
+            Some((i as u32, start, start + title.encode_utf16().count() as u32))
+        })
+    }
+
     pub fn parse(text: &str) -> anyhow::Result<Note> {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let text = text.replace("\r\n", "\n");
         let Some(rest) = text.strip_prefix("+++\n") else {
             bail!("note does not start with a +++ front-matter block");
         };
-        // A `+++` line can also appear inside the snippet string (a diff, say),
-        // so the closing fence is the first `+++` line after which the front
-        // matter parses. Cutting inside the snippet leaves an unclosed string.
+        // `+++` can also show up inside the snippet string (a diff, say). Take the
+        // first `+++` line after which the front matter actually parses; cutting
+        // inside the snippet leaves an unclosed string and fails.
         let mut first_err = None;
         for (end, _) in rest.match_indices("\n+++") {
             let after = &rest[end + 4..];
@@ -84,7 +195,7 @@ impl Note {
         out
     }
 
-    /// The first non-empty body line, without a leading Markdown heading marker.
+    /// First non-empty body line, minus any leading `#` marker
     pub fn title(&self) -> &str {
         self.body
             .lines()
@@ -93,13 +204,12 @@ impl Note {
             .unwrap_or("(untitled note)")
     }
 
-    /// The title as plain text, for places that don't render Markdown
-    /// (diagnostics, symbols, the CLI): backslash escapes are removed.
+    /// Title without backslash escapes, for diagnostics, symbols and the CLI
+    /// (none of which render Markdown)
     pub fn plain_title(&self) -> String {
         crate::markdown::unescape(self.title())
     }
 
-    /// The body with the title line removed.
     pub fn details(&self) -> &str {
         match self.body.trim_start().split_once('\n') {
             Some((_, rest)) => rest.trim(),
@@ -108,7 +218,7 @@ impl Note {
     }
 }
 
-/// Reject note files whose fields would make us touch the wrong place on disk.
+/// Rejects notes whose fields would point us at the wrong place on disk
 fn validate(meta: &Meta) -> anyhow::Result<()> {
     if !is_valid_id(&meta.id) {
         bail!(
@@ -128,7 +238,40 @@ fn validate(meta: &Meta) -> anyhow::Result<()> {
     if meta.start_line == 0 || meta.end_line < meta.start_line {
         bail!("invalid line range {}-{}", meta.start_line, meta.end_line);
     }
+    if let Some(t) = meta.tags.iter().find(|t| !is_valid_tag(t)) {
+        bail!("tag {t:?} must be up to 32 lowercase letters, digits, '-', '_' or '.'");
+    }
+    if meta.tags.len() > MAX_TAGS {
+        bail!("a note can have at most {MAX_TAGS} tags");
+    }
     Ok(())
+}
+
+pub const MAX_TAGS: usize = 16;
+
+/// Tags show up in hovers, `cmd-t` and reports. Keep them plain: no spaces,
+/// no Markdown.
+pub fn is_valid_tag(tag: &str) -> bool {
+    (1..=32).contains(&tag.len())
+        && tag.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Scanner tag -> note tag, if possible. CWE ids in their many spellings
+/// (`CWE-89: Improper...`, `external/cwe/cwe-089`) become `cwe-89`; anything
+/// else must already be plain apart from case.
+pub fn tag_from_scanner(raw: &str) -> Option<String> {
+    let t = raw.trim().to_ascii_lowercase();
+    let head = t.split(':').next().unwrap_or_default();
+    let last = head.rsplit('/').next().unwrap_or_default().trim();
+    if let Some(n) = last.strip_prefix("cwe")
+        && let Ok(n) = n.trim_start_matches(['-', '_', ' ']).parse::<u32>()
+    {
+        return Some(format!("cwe-{n}"));
+    }
+    is_valid_tag(&t).then_some(t)
 }
 
 pub fn is_valid_id(id: &str) -> bool {
@@ -154,8 +297,12 @@ mod tests {
                 created: "2026-10-09T10:00:00Z".parse().unwrap(),
                 source: Some("semgrep".into()),
                 rule: Some("ruby.sql".into()),
+                tags: Vec::new(),
                 fingerprint: Some("abc".into()),
                 snippet: "def show\n  User.find_by_sql(\"\"\"x\"\"\")\nend\n".into(),
+                context_before: None,
+                context_after: None,
+                extra: Default::default(),
             },
             body: "# SQL injection\n\nReachable from GET /users/:id.".into(),
         }
@@ -177,6 +324,108 @@ mod tests {
         note.body = "# Diff\n\n+++\nnot a fence".into();
         let parsed = Note::parse(&note.render()).unwrap();
         assert_eq!(parsed, note);
+    }
+
+    #[test]
+    fn keeps_fields_from_newer_versions() {
+        let text = sample().render().replacen(
+            "+++\n\n",
+            "labels = [\"cwe-89\"]\nseverity = 7\n\n[review]\nround = 2\n+++\n\n",
+            1,
+        );
+        let note = Note::parse(&text).unwrap();
+        assert_eq!(note.meta.extra["labels"].as_array().unwrap().len(), 1);
+        assert_eq!(note.meta.extra["review"]["round"].as_integer(), Some(2));
+        let mut changed = note.clone();
+        changed.meta.status = "ok".into();
+        let again = Note::parse(&changed.render()).unwrap();
+        assert_eq!(again.meta.extra, note.meta.extra);
+        assert_eq!(again.meta.status, "ok");
+        // native TOML datetime should stay a datetime
+        let text =
+            sample()
+                .render()
+                .replacen("+++\n\n", "reviewed_at = 2026-10-01T00:00:00Z\n+++\n\n", 1);
+        assert!(
+            Note::parse(&text)
+                .unwrap()
+                .render()
+                .contains("\nreviewed_at = 2026-10-01T00:00:00Z\n")
+        );
+    }
+
+    /// From the version before tags, plus a key from a newer one
+    const OLD_NOTE: &str = r#"+++
+id = "95288894"
+file = "app/users.py"
+start_line = 9
+end_line = 9
+status = "open"
+author = "CodeQL"
+created = "2026-10-14T15:59:00Z"
+source = "CodeQL"
+rule = "py/sql-injection"
+fingerprint = "8eeb31a9bde35bceaec32dabb32db5a5"
+snippet = """
+    cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
+"""
+context_before = "cursor = db.cursor()"
+context_after = "return cursor.fetchone()"
+reviewed_by = "bob"
++++
+
+# This SQL query depends on a user-provided value.
+
+Imported from CodeQL, rule `py/sql-injection`, level error.
+"#;
+
+    #[test]
+    fn note_without_tags_round_trips_byte_for_byte() {
+        let note = Note::parse(OLD_NOTE).unwrap();
+        assert!(note.meta.tags.is_empty());
+        assert_eq!(note.render(), OLD_NOTE);
+        let mut tagged = note.clone();
+        tagged.meta.tags = vec!["cwe-89".into(), "security".into()];
+        let text = tagged.render();
+        assert!(
+            text.contains("rule = \"py/sql-injection\"\ntags = [\"cwe-89\", \"security\"]\n"),
+            "{text}"
+        );
+        assert_eq!(Note::parse(&text).unwrap(), tagged);
+    }
+
+    #[test]
+    fn tags_are_plain() {
+        for bad in [
+            "",
+            "SQL",
+            "a b",
+            "[x](http://e)",
+            "-x",
+            "é",
+            &"a".repeat(33),
+        ] {
+            let mut note = sample();
+            note.meta.tags = vec![bad.to_string()];
+            assert!(Note::parse(&note.render()).is_err(), "{bad:?}");
+        }
+        let mut note = sample();
+        note.meta.tags = (0..=MAX_TAGS).map(|i| format!("t{i}")).collect();
+        assert!(Note::parse(&note.render()).is_err());
+        for (raw, want) in [
+            (
+                "CWE-89: Improper Neutralization of Special Elements",
+                Some("cwe-89"),
+            ),
+            ("external/cwe/cwe-089", Some("cwe-89")),
+            ("cwe_22", Some("cwe-22")),
+            ("Security", Some("security")),
+            ("OWASP-A01:2017 - Injection", None),
+            ("python 3", None),
+            ("[x](http://evil)", None),
+        ] {
+            assert_eq!(tag_from_scanner(raw).as_deref(), want, "{raw}");
+        }
     }
 
     #[test]

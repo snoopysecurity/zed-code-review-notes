@@ -1,4 +1,4 @@
-//! Importing the real scanner output in `fixtures/`.
+//! Imports the real scanner output in `fixtures/`.
 
 mod common;
 
@@ -63,8 +63,7 @@ fn adversarial_fixture() {
     );
 }
 
-/// Imports `report` into a fresh demo app; returns the summary and the notes
-/// as `(file, line, title)`, sorted.
+/// Returns the import summary and the notes as sorted `(file, line, title)`
 fn import_into_demo(report: &str) -> (Summary, Vec<(String, u32, String)>) {
     let dir = demo_app();
     let store = Store::new(dir.path());
@@ -109,10 +108,39 @@ fn codeql_rules_in_extensions_and_artifact_index() {
             ("app/users.py", 14),
         ]
     );
-    // Links to related locations become plain text.
+    // related-location links become plain text
     assert_eq!(
         notes[2].2,
         "# This SQL query depends on a user-provided value."
+    );
+}
+
+#[test]
+fn codeql_data_flow() {
+    let dir = demo_app();
+    let store = Store::new(dir.path());
+    import_file(&store, &Config::default(), &fixture("codeql.sarif")).unwrap();
+    let notes = store.load_all().0;
+    let sql = notes
+        .iter()
+        .find(|n| n.meta.rule.as_deref() == Some("py/sql-injection"))
+        .unwrap();
+    assert!(
+        sql.body.contains(
+            "Data flow:\n\n1. `app/users.py:7` — ControlFlowNode for user\\_id\n\
+             2. `app/users.py:9` — ControlFlowNode for Fstring\n"
+        ),
+        "{}",
+        sql.body
+    );
+    // `external/cwe/cwe-089` counts as a CWE id
+    assert_eq!(sql.meta.tags, ["security", "cwe-89"]);
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|n| n.body.contains("Data flow"))
+            .count(),
+        1
     );
 }
 
@@ -178,4 +206,93 @@ fn sarif_spec_edge_cases() {
         "{:?}",
         s.rejected
     );
+}
+
+#[test]
+fn gitlab_sast_report() {
+    let (s, notes) = import_into_demo("gl-sast-report.json");
+    assert_eq!(
+        (s.imported, s.rejected.len()),
+        (3, 0),
+        "{s} {:?}",
+        s.rejected
+    );
+    assert_eq!(s.tools, ["Semgrep"]);
+    let at: Vec<_> = notes.iter().map(|(f, l, _)| (f.as_str(), *l)).collect();
+    assert_eq!(
+        at,
+        [
+            ("app/controllers/users_controller.rb", 7),
+            ("app/users.py", 9),
+            ("app/users.py", 14),
+        ]
+    );
+    assert_eq!(
+        notes[1].2,
+        r"# Improper neutralization of special elements used in an SQL Command \('SQL Injection'\)"
+    );
+    let text = std::fs::read_to_string(fixture("gl-sast-report.json")).unwrap();
+    let parsed = code_review_notes::import::parse(&text).unwrap();
+    assert_eq!(
+        parsed.findings[0].rule,
+        "python_sql_rule-hardcoded-sql-expression"
+    );
+    assert_eq!(parsed.findings[0].tags, ["cwe-89"]);
+    assert!(
+        parsed.findings[1]
+            .message
+            .contains("likely false positive by vet")
+    );
+}
+
+#[test]
+fn gitlab_secret_detection_report() {
+    let (s, notes) = import_into_demo("gl-secret-detection-report.json");
+    assert_eq!(
+        (s.imported, s.rejected.len()),
+        (1, 0),
+        "{s} {:?}",
+        s.rejected
+    );
+    assert_eq!(s.tools, ["Gitleaks"]);
+    assert_eq!(
+        notes,
+        [("config/settings.py".into(), 4, "# AWS access token".into())]
+    );
+}
+
+#[test]
+fn gitlab_dependency_findings_are_rejected_with_a_reason() {
+    let (s, notes) = import_into_demo("gl-dependency-scanning-report.json");
+    assert_eq!((s.imported, notes.len()), (0, 0), "{s}");
+    assert_eq!(
+        s.rejected,
+        [
+            "gemnasium-python vulnerability 1 (6c2b1a3f-0a6e-4d36-9a0f-1b0a3c6e1d2f): \
+          dependency Django 3.2.0 in requirements.txt has no line to attach to"
+        ]
+    );
+}
+
+#[test]
+fn tags_come_from_the_rule_and_identifiers() {
+    let dir = demo_app();
+    let store = Store::new(dir.path());
+    let config = Config::default();
+    import_file(&store, &config, &fixture("snyk-code.sarif")).unwrap();
+    import_file(&store, &config, &fixture("gl-sast-report.json")).unwrap();
+    let tags = |rule: &str| {
+        store
+            .load_all()
+            .0
+            .into_iter()
+            .find(|n| n.meta.rule.as_deref() == Some(rule))
+            .unwrap()
+            .meta
+            .tags
+    };
+    assert_eq!(tags("python/Sqli"), ["python", "sqli", "security"]);
+    assert!(tags("python/CommandInjection").is_empty());
+    assert_eq!(tags("python_sql_rule-hardcoded-sql-expression"), ["cwe-89"]);
+    assert_eq!(tags("ruby_redirect_rule-CheckRedirect"), ["cwe-601"]);
 }

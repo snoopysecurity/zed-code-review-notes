@@ -1,0 +1,49 @@
+---
+source: code-review-notes/src/export.rs
+expression: out
+---
+[
+  {
+    "body": "# SQL @all [x](http://evil) `t`\n\n/assign @someone\n![p](http://evil/p.png)\n```\nfence\n```",
+    "changed": true,
+    "meta": {
+      "author": "alice",
+      "created": "2026-10-01T10:00:00Z",
+      "end_line": 4,
+      "file": "a.py",
+      "id": "aaaaaaaa",
+      "reviewed_at": "2026-10-01T00:00:00Z",
+      "rule": "python.sqli",
+      "snippet": "db.query(f\"{id}\")\n",
+      "source": "semgrep",
+      "start_line": 3,
+      "status": "issue",
+      "tags": [
+        "cwe-89",
+        "sec_rity"
+      ]
+    },
+    "stale": false,
+    "status_label": "Issue",
+    "title": "SQL @all [x](http://evil) `t`",
+    "unreadable": null
+  },
+  {
+    "body": "# Fine",
+    "changed": false,
+    "meta": {
+      "author": "alice",
+      "created": "2026-10-01T10:00:00Z",
+      "end_line": 2,
+      "file": "b.py",
+      "id": "bbbbbbbb",
+      "snippet": "x\n",
+      "start_line": 1,
+      "status": "ok"
+    },
+    "stale": true,
+    "status_label": "OK",
+    "title": "Fine",
+    "unreadable": null
+  }
+]
