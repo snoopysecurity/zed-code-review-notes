@@ -124,17 +124,17 @@ impl Config {
             }
             Ok(_) => {}
         }
-        let text = safety::read_limited(&path, MAX_CONFIG_BYTES, FILE);
-        let parsed = text
-            .as_deref()
-            .map_err(|e| anyhow::anyhow!("{e:#}"))
-            .and_then(|t| Ok(toml::from_str::<Config>(t)?))
-            .and_then(|c| c.validate().map(|_| c));
+        let parsed = (|| -> anyhow::Result<_> {
+            let text = safety::read_limited(&path, MAX_CONFIG_BYTES, FILE)?;
+            let config: Config = toml::from_str(&text)?;
+            config.validate()?;
+            Ok((config, text))
+        })();
         match parsed {
             // Unknown keys are allowed (configs from newer versions keep working) but
             // we name them so typos get noticed
-            Ok(c) => {
-                let unknown = text.as_deref().map(unknown_keys).unwrap_or_default();
+            Ok((c, text)) => {
+                let unknown = unknown_keys(&text);
                 let warning = (!unknown.is_empty()).then(|| {
                     format!(
                         "{FILE}: ignoring unknown {} {} (a typo, or from a newer version?)",

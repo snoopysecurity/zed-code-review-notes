@@ -93,10 +93,6 @@ fn load_entries(store: &store::Store) -> Vec<export::Entry> {
     export::check_staleness(store, notes)
 }
 
-fn status_label(config: &code_review_notes::config::Config, e: &export::Entry) -> String {
-    format!("{}{}", config.label(&e.note.meta.status), e.state())
-}
-
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cmd = match cli.cmd {
@@ -209,7 +205,7 @@ fn main() -> anyhow::Result<()> {
                 println!(
                     "{}  {:<16}  {}:{}-{}  {}{tags}",
                     m.id,
-                    status_label(&config, &e),
+                    format!("{}{}", config.label(&m.status), e.state()),
                     m.file,
                     m.start_line,
                     m.end_line,

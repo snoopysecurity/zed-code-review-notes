@@ -37,9 +37,8 @@ impl Anchor {
     }
 }
 
-fn normalized(lines: &[&str]) -> Vec<String> {
+fn normalized<'a>(lines: impl Iterator<Item = &'a str>) -> Vec<String> {
     lines
-        .iter()
         .map(|l| l.trim_start_matches('\u{feff}').trim())
         .filter(|l| !l.is_empty())
         .map(str::to_string)
@@ -47,7 +46,7 @@ fn normalized(lines: &[&str]) -> Vec<String> {
 }
 
 pub fn normalize(snippet: &str) -> String {
-    normalized(&snippet.lines().collect::<Vec<_>>()).join("\n")
+    normalized(snippet.lines()).join("\n")
 }
 
 /// Lines `start..=end` (1-based), clamped to the file and MAX_SNIPPET_LINES,
@@ -117,7 +116,7 @@ pub fn locate(snippet: &str, start: u32, end: u32, text: &str) -> Anchor {
 }
 
 pub fn locate_in(snippet: &str, ctx: Context, start: u32, end: u32, text: &str) -> Anchor {
-    let wanted = normalized(&snippet.lines().collect::<Vec<_>>());
+    let wanted = normalized(snippet.lines());
     if wanted.is_empty() {
         return Anchor::Exact { start, end };
     }
@@ -128,7 +127,7 @@ pub fn locate_in(snippet: &str, ctx: Context, start: u32, end: u32, text: &str) 
         .skip(s)
         .take((end as usize).saturating_sub(s))
         .collect();
-    if !here.is_empty() && normalized(&here) == wanted {
+    if !here.is_empty() && normalized(here.iter().copied()) == wanted {
         return Anchor::Exact { start, end };
     }
 

@@ -1127,7 +1127,6 @@ impl Server {
             return out;
         };
 
-        // In a note file: change its status
         if let Some(id) = Self::note_file_id(rel) {
             if let Some(note) = self.notes.iter().find(|n| n.meta.id == id) {
                 out.extend(status_actions(note, &self.config, false));
@@ -1135,7 +1134,6 @@ impl Server {
             return out;
         }
 
-        // open scanner report
         if doc.is_report() {
             out.push(action(
                 "Import into Code Review Notes",

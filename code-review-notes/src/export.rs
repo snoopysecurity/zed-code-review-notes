@@ -250,21 +250,24 @@ fn sarif_level(s: Severity) -> &'static str {
 /// Markdown message.
 pub fn render_sarif(config: &Config, entries: &mut [Entry]) -> String {
     sort(entries);
-    let rule = |e: &Entry| e.note.meta.rule.clone().unwrap_or_else(|| NOTE_RULE.into());
-    let mut rules: Vec<String> = entries.iter().map(rule).collect();
+    let mut rules: Vec<&str> = entries
+        .iter()
+        .map(|e| e.note.meta.rule.as_deref().unwrap_or(NOTE_RULE))
+        .collect();
     rules.sort();
     rules.dedup();
     let results: Vec<Value> = entries
         .iter()
         .map(|e| {
             let m = &e.note.meta;
+            let rule = m.rule.as_deref().unwrap_or(NOTE_RULE);
             let mut region = json!({"startLine": m.start_line, "endLine": m.end_line});
             if !m.snippet.is_empty() {
                 region["snippet"] = json!({"text": m.snippet});
             }
             json!({
-                "ruleId": rule(e),
-                "ruleIndex": rules.binary_search(&rule(e)).unwrap_or_default(),
+                "ruleId": rule,
+                "ruleIndex": rules.binary_search(&rule).unwrap_or_default(),
                 "level": sarif_level(config.severity(&m.status)),
                 "message": {"text": e.note.plain_title()},
                 "locations": [{"physicalLocation": {

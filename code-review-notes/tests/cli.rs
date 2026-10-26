@@ -1,5 +1,3 @@
-//! CLI tests, running the real binary.
-
 mod common;
 
 use std::path::Path;

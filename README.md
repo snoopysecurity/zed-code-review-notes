@@ -1,19 +1,18 @@
 # Code Review Notes for Zed
 
-Take notes on code while reviewing it in Zed, and pull in findings from SAST tools.
-
-Each note is a Markdown file in `.code-review-notes/` at the project root, kept in git next to the code. Share a review, diff it, or come back to it later. Noted lines are underlined in their status colour, the hover shows the note, and Zed's agent can list, add and re-status notes. Imports cover SARIF 2.1.0 (CodeQL, Snyk, semgrep, bandit, gosec, checkov, ...), GitLab SAST and secret detection reports, and brakeman.
+Code Review Notes is a Zed extension for adding review notes to code and importing findings from SAST tools. Notes are Markdown files in `.code-review-notes/` at the project root.
 
 ## Install
 
-You need Rust via [rustup](https://rustup.rs). Zed uses it to build dev extensions, and `rust-toolchain.toml` pulls in the `wasm32-wasip2` target.
+Install Rust with [rustup](https://rustup.rs), then run these commands from the repository root:
 
-1. `cargo install --path code-review-notes`. The extension looks for the binary on your login shell's `PATH`, then in `~/.cargo/bin`. The `lsp.code-review-notes.binary.path` setting overrides both.
-2. In Zed, run **zed: install dev extension** and pick the `zed-extension/` folder.
-3. Open a project and trust it (the *Restricted Mode* indicator in the title bar). Zed won't start language servers otherwise.
-4. If **Add review note** shows up in the code actions, it works.
+```sh
+cargo install --path code-review-notes
+```
 
-After changing the Rust code, re-run `cargo install` and then **editor: restart language server**. After changing `zed-extension/`, rebuild it from **zed: extensions**.
+In Zed, run **zed: install dev extension** and select `zed-extension/`. Trust the project if Zed shows *Restricted Mode*. You should then see **Add review note** in the code actions menu.
+
+After changing the Rust code, run `cargo install --path code-review-notes` again and restart the language server. After changing `zed-extension/`, reinstall the dev extension.
 
 ## Quick start
 
@@ -162,8 +161,9 @@ It uses the same binary as the language server, falling back to `code-review-not
 
 | Symptom | Fix |
 | --- | --- |
-| *compiling Rust extension* fails with `running rustc: No such file or directory` | Load Rust in your login shell (e.g. `. "$HOME/.cargo/env"` in `~/.zprofile`), then `cmd-q` Zed and reopen. |
+| *compiling Rust extension* fails with `running rustc: No such file or directory` | Zed was launched without Cargo on `PATH`. Add `. "$HOME/.cargo/env"` to `~/.profile`, log out and in, or launch Zed from a terminal after running `source "$HOME/.cargo/env"`. |
 | Same error with `can't find crate for core` / `wasm32-wasip2` | `rustup target add wasm32-wasip2` |
+| *compiling Rust extension* cannot resolve `index.crates.io` | Check your network connection and retry; Zed must download the extension's Rust dependency once. |
 | No **Add review note** | Trust the project, then check **dev: open language server logs** → *Code Review Notes*. |
 | *Failed to run code-review-notes* | Install the binary, or set `{ "lsp": { "code-review-notes": { "binary": { "path": "/Users/you/.cargo/bin/code-review-notes" } } } }` |
 | No notes in some file type | Add the language from Zed's status bar to `languages` in `zed-extension/extension.toml` and rebuild. |
@@ -212,17 +212,6 @@ Assume the repository under review is hostile.
 - Scanner messages are Markdown-escaped, file reads are size-limited, and note files are written atomically.
 - Anyone with commit access can plant notes that are pre-marked OK, claim to be from a scanner or from you, or carry links. Hovers render links as plain text and flag notes by other authors or committers. Still check `git log -- .code-review-notes`, and clear the folder before reviewing an untrusted repo. The Markdown report keeps links.
 - The agent reads those notes too. It's told note text is data, not instructions, but it can still be misled. Check what it changes.
-
-## Development
-
-```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build && python3 scripts/lsp_e2e.py    # drives the language server like Zed does
-(cd zed-extension && cargo build --target wasm32-wasip2)
-```
-
-CI (`.github/workflows/ci.yml`) runs these on Linux and macOS. The library and CLI are in `code-review-notes/`, the WASM extension in `zed-extension/`, and test reports (including `adversarial.sarif`) in `fixtures/`.
 
 ## License
 

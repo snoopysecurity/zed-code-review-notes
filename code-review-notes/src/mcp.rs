@@ -323,10 +323,9 @@ impl<W: Write> Server<W> {
         let config = self.config();
         let m = &note.meta;
         let read = export::source(store, &m.file);
-        let anchor = read.as_ref().ok().cloned().flatten().map(|text| {
-            let a = anchor::locate_in(&m.snippet, m.context(), m.start_line, m.end_line, &text);
-            (a, text)
-        });
+        let text = read.as_ref().ok().and_then(Option::as_deref);
+        let anchor = text
+            .map(|text| anchor::locate_in(&m.snippet, m.context(), m.start_line, m.end_line, text));
         let mut out = format!("{DATA_WARNING}\n\n");
         out.push_str(&format!(
             "id: {}\nstatus: {}\nfile: {}\nlines: {}-{}\nauthor: {}\ncreated: {}\n",
@@ -347,32 +346,31 @@ impl<W: Write> Server<W> {
         if !m.tags.is_empty() {
             out.push_str(&format!("tags: {}\n", m.tags.join(", ")));
         }
-        match &anchor {
-            None if read.is_err() => out.push_str(&format!(
+        match (&read, anchor) {
+            (Err(error), _) => out.push_str(&format!(
                 "state: unknown, {} can't be read ({}); its code may well be there\n",
-                m.file,
-                read.as_ref().err().map(String::as_str).unwrap_or_default()
+                m.file, error
             )),
-            Some((Anchor::Stale { .. }, _)) | None => {
+            (_, Some(Anchor::Stale { .. }) | None) => {
                 out.push_str("state: stale, the code this note was made on is gone\n")
             }
-            Some((Anchor::Changed { start, end }, _)) => out.push_str(&format!(
+            (_, Some(Anchor::Changed { start, end })) => out.push_str(&format!(
                 "state: changed, the code was edited since; it is now at lines {start}-{end}\n"
             )),
-            Some((Anchor::Moved { start, end }, _)) => {
+            (_, Some(Anchor::Moved { start, end })) => {
                 out.push_str(&format!("state: moved to lines {start}-{end}\n"))
             }
-            Some((Anchor::Exact { .. }, _)) => {}
+            (_, Some(Anchor::Exact { .. })) => {}
         }
         out.push_str(&format!(
             "\n## Note\n\n{}\n\n## Code it was made on\n\n{}",
             note.body,
             fenced(&m.snippet)
         ));
-        if let Some((Anchor::Changed { start, end }, text)) = &anchor {
+        if let (Some(Anchor::Changed { start, end }), Some(text)) = (anchor, text) {
             out.push_str(&format!(
                 "\n## Code there now\n\n{}",
-                fenced(&anchor::extract(text, *start, *end))
+                fenced(&anchor::extract(text, start, end))
             ));
         }
         Ok(out)

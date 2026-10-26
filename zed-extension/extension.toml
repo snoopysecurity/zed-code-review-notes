@@ -2,7 +2,7 @@ id = "code-review-notes"
 name = "Code Review Notes"
 version = "0.1.0"
 schema_version = 1
-authors = ["Sam Sanoop <https://github.com/snoopysecurity>"]
+authors = ["snoopysecurity <samsanoop@outlook.com>"]
 description = "Keep notes on code during a review, and import SAST findings (SARIF, brakeman)."
 repository = "https://github.com/snoopysecurity/zed-code-review-notes"
 

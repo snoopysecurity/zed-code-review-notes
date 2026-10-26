@@ -1,5 +1,3 @@
-//! Imports the real scanner output in `fixtures/`.
-
 mod common;
 
 use code_review_notes::config::Config;
