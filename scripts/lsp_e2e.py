@@ -225,19 +225,22 @@ notify("textDocument/didSave", {"textDocument": {"uri": py}})
 time.sleep(0.3)
 ok("start_line = 49" in (root / f".code-review-notes/{sql_id}.md").read_text(), "save writes moved anchor back to the note")
 
-if shutil.which("semgrep"):
-    subprocess.run(["semgrep", "--metrics=off", "--disable-version-check", "--no-git-ignore", "--config", str(FIXTURES / "rules/demo.yml"),
-                    "--sarif", "-o", str(root / "scan.sarif"), "app/users.py"], cwd=root, check=True, capture_output=True)
-    sarif = uri("scan.sarif")
-    notify("textDocument/didOpen", {"textDocument": {"uri": sarif, "languageId": "json", "version": 1, "text": (root / "scan.sarif").read_text()}})
-    acts = request("textDocument/codeAction", {"textDocument": {"uri": sarif}, "range": rng, "context": {"diagnostics": []}})
-    imp = next(a for a in acts if a["title"] == "Import into Code Review Notes")
-    request("workspace/executeCommand", imp["command"])
-    msg = wait(lambda m: m.get("method") == "window/showMessage", "import summary")
-    ok("imported 0, skipped 2" in msg["params"]["message"], f"re-scan after the code moved, imported from the editor, adds nothing: {msg['params']['message']}")
-
-else:
-    print("SKIP re-scan check (semgrep not installed)")
+# Model a fresh scan after the source moved, then import it through the editor.
+# This exercises the code action in CI without a scanner installation.
+report = json.loads((root / "scan.sarif").read_text())
+for result in report["runs"][0]["results"]:
+    region = result["locations"][0]["physicalLocation"]["region"]
+    region["startLine"] += 40
+    region["endLine"] += 40
+(root / "scan.sarif").write_text(json.dumps(report))
+sarif = uri("scan.sarif")
+notify("textDocument/didOpen", {"textDocument": {"uri": sarif, "languageId": "json", "version": 1, "text": (root / "scan.sarif").read_text()}})
+acts = request("textDocument/codeAction", {"textDocument": {"uri": sarif}, "range": rng, "context": {"diagnostics": []}})
+imp = next(a for a in acts if a["title"] == "Import into Code Review Notes")
+request("workspace/executeCommand", imp["command"])
+msg = wait(lambda m: m.get("method") == "window/showMessage", "import summary")
+ok("imported 0, skipped 2" in msg["params"]["message"], f"re-import after the code moved adds nothing: {msg['params']['message']}")
+ok(len(list((root / ".code-review-notes").glob("*.md"))) == 5, "editor import does not duplicate notes")
 
 # Editing the noted line keeps the note on it, marked as changed.
 edited = shifted.replace('"ping -c 1 " + host,', '"ping -c 1 " + hostname,')
