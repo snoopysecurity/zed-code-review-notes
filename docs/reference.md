@@ -96,13 +96,22 @@ Hovers show author, date, and scanner rule. Inlay hints show the status and titl
 
 ## Zed agent
 
-The extension's context server provides `list_notes`, `get_note`, `add_note`, and `set_status`. Enable *code-review-notes* in the agent panel settings. Agent changes are recorded under your name with *(agent)*.
+The optional `code-review-notes mcp` command provides `list_notes`, `get_note`, `add_note`, and `set_status`. The Zed extension does not start it automatically. Agent changes are recorded under your name with *(agent)*.
 
-The context server uses the same binary as the language server. If it cannot start or does not know the project folder, configure it in Zed settings:
+After installing the CLI, open **Settings → AI → MCP Servers** in Zed and add a local server. Set its command to `code-review-notes` and its arguments to `mcp`, `--root`, and the absolute path to your project. You can also add this entry to your Zed settings file:
 
 ```json
-{ "context_servers": { "code-review-notes": { "command": { "path": "code-review-notes", "arguments": ["mcp", "--root", "/path/to/project"] } } } }
+{
+  "context_servers": {
+    "code-review-notes": {
+      "command": "code-review-notes",
+      "args": ["mcp", "--root", "/path/to/project"]
+    }
+  }
+}
 ```
+
+Replace `/path/to/project` with the project you want the agent to use. This server connects to Zed's agent; the editor's review note actions work without it.
 
 ## Language support
 

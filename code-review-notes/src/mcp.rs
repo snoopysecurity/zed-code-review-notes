@@ -1,4 +1,4 @@
-//! MCP server on stdio for Zed's agent, started via the extension's context server.
+//! Optional MCP server on stdio for Zed's agent, configured separately from the extension.
 //!
 //! Project root: `--root`, else the client's first MCP root, else the nearest
 //! dir above cwd with `.code-review-notes/` or `.git/`.
@@ -252,7 +252,7 @@ impl<W: Write> Server<W> {
     fn store(&self) -> anyhow::Result<&Store> {
         self.store.as_ref().context(
             "the project folder is not known: Zed did not list one, and the server was not \
-             started inside a project. Set `context_servers.code-review-notes.command.arguments` \
+             started inside a project. Set `context_servers.code-review-notes.args` \
              to [\"mcp\", \"--root\", \"/path/to/project\"] in Zed's settings.",
         )
     }

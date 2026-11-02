@@ -65,7 +65,7 @@ See [export details](docs/reference.md#exports).
 
 ## Zed agent
 
-Enable *code-review-notes* in the agent panel to let the agent list, read, add, and change notes. Review its edits, especially when notes come from an untrusted repository. See [agent setup](docs/reference.md#zed-agent).
+Agent access is optional and requires [adding the CLI as a local MCP server](docs/reference.md#zed-agent) in Zed. The extension does not set this up automatically. Once configured, the agent can list, read, add, and change notes. Review its edits, especially when notes come from an untrusted repository.
 
 ## Troubleshooting
 

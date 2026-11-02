@@ -6,8 +6,9 @@ authors = ["snoopysecurity <samsanoop@outlook.com>"]
 description = "Keep notes on code during a review, and import SAST findings (SARIF, brakeman)."
 repository = "https://github.com/snoopysecurity/zed-code-review-notes"
 
-# MCP server so Zed's agent can list, read, add and mark notes.
-[context_servers.code-review-notes]
+[grammars.json]
+repository = "https://github.com/tree-sitter/tree-sitter-json"
+rev = "254c42a6476413b776221e03982ac8ae159eeb72"
 
 [language_servers.code-review-notes]
 name = "Code Review Notes"
