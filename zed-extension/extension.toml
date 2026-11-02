@@ -3,7 +3,7 @@ name = "Code Review Notes"
 version = "0.1.0"
 schema_version = 1
 authors = ["snoopysecurity <samsanoop@outlook.com>"]
-description = "Keep notes on code during a review, and import SAST findings (SARIF, brakeman)."
+description = "Keep code review notes alongside your code and import security findings from SARIF reports."
 repository = "https://github.com/snoopysecurity/zed-code-review-notes"
 
 [grammars.json]

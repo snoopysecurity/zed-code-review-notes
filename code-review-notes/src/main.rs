@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(
     name = "code-review-notes",
     version,
-    about = "Code review notes for Zed, with SAST import"
+    about = "Keep code review notes alongside your code and import security findings from SARIF reports"
 )]
 struct Cli {
     /// Project root (default: nearest directory above the cwd with .code-review-notes/ or .git/)

@@ -2,7 +2,7 @@
 
 ![Adding a review note in Zed](docs/images/add-a-note.gif)
 
-Add review notes to code in Zed and import findings from SARIF, Brakeman, and GitLab security reports. Notes are Markdown files in `.code-review-notes/` at the project root.
+Keep code review notes alongside your code and import security findings from SARIF reports. Notes are Markdown files in `.code-review-notes/` at the project root.
 
 ## Install
 
