@@ -1,0 +1,4 @@
+name = "SARIF"
+grammar = "json"
+path_suffixes = ["sarif"]
+tab_size = 2

@@ -15,6 +15,7 @@ name = "Code Review Notes"
 # Uninstalled extension languages are just ignored. "Plain Text" covers files
 # no language claims (e.g. `.rb` without the Ruby extension).
 languages = [
+  "SARIF",
   # built in
   "C", "C++", "CSS", "Diff", "Env", "Git Commit", "Go", "Go Mod", "Go Work",
   "JavaScript", "JSON", "JSONC", "Markdown", "Plain Text", "Python", "Rust",
