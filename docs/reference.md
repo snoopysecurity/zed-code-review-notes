@@ -37,7 +37,7 @@ Without `new_note_status` or `import_status`, the first configured status is use
 
 ## Scanner reports
 
-Supported inputs include SARIF from CodeQL, Semgrep, Snyk, Bandit, Gosec, and others; Brakeman JSON; and GitLab SAST and secret-detection JSON. Open the report in Zed or pass it to `code-review-notes import` from the project root.
+Supported inputs include SARIF from CodeQL, Semgrep, Snyk, Bandit, Gosec, and others; Brakeman JSON; and GitLab SAST and secret-detection JSON. In Zed, enable the server for JSON to import `.json` reports, or for Plain Text to import `.sarif` reports opened as Plain Text. You can also pass a report to `code-review-notes import` from the project root.
 
 SARIF creates one note per result, at the first location with a file and start line. The first `codeFlows` path contributes up to 20 plain-text steps. Rule metadata supplies severity, tags, and a fallback title. Suppressed results, `pass` / `notApplicable` kinds, and `baselineState: absent` are skipped. Results without a file or line are rejected.
 
@@ -115,7 +115,20 @@ Replace `/path/to/project` with the project you want the agent to use. This serv
 
 ## Language support
 
-The extension serves Zed's built-in languages, common extension languages, SARIF, and Plain Text. For another language, add its exact status-bar name to `languages` in `zed-extension/extension.toml` and reinstall the dev extension. Extensions cannot add keybindings; use **zed: open keymap file** to set your own:
+The `code-review-notes-lsp` extension supports the languages listed in `zed-extension/extension.toml`, but each language is opt-in. Add `code-review-notes` to the language's `language_servers` setting, keeping `"..."` for its other servers. For example, to use review notes in Python and Markdown and import JSON and `.sarif` reports:
+
+```json
+{
+  "languages": {
+    "Python": { "language_servers": ["code-review-notes", "..."] },
+    "Markdown": { "language_servers": ["code-review-notes", "..."] },
+    "JSON": { "language_servers": ["code-review-notes", "..."] },
+    "Plain Text": { "language_servers": ["code-review-notes", "..."] }
+  }
+}
+```
+
+The server's settings key remains `code-review-notes`, including under `lsp`. A `.sarif` file no longer has a language definition from this extension; in Zed 1.27.0 it opens as **Unknown**. Select **Plain Text** in Zed's language picker before using the import action. For another reviewable language, add its exact status-bar name to both `languages` and `opt_in_languages` in `zed-extension/extension.toml`, then reinstall the dev extension and opt in through settings. Zed versions that do not support `opt_in_languages` ignore it and start the server for all listed languages. Extensions cannot add keybindings; use **zed: open keymap file** to set your own:
 
 ```json
 [{ "context": "Editor", "bindings": { "cmd-alt-n": "editor::ToggleCodeActions" } }]
