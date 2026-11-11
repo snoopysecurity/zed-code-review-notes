@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Make the Zed extension an opt-in language server under the ID `code-review-notes-lsp`.
+- Remove its SARIF file type and grammar; import `.sarif` reports in Zed after selecting Plain Text.
+
 ## [0.1.0] - 2026-11-02
 
 Initial release of Code Review Notes for Zed.
