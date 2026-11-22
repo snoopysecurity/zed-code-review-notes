@@ -2,8 +2,11 @@
 
 ## Unreleased
 
+## [0.2.0] - 2026-11-22
+
 - Make the Zed extension an opt-in language server under the ID `code-review-notes-lsp`.
-- Remove its SARIF file type and grammar; import `.sarif` reports in Zed after selecting Plain Text.
+- Remove its SARIF file type and grammar. To import `.sarif` reports in Zed, enable the server for Plain Text and associate `.sarif` files with Plain Text in Zed settings, or select Plain Text for each report.
+- Keep the existing `code-review-notes` CLI and language server settings key. The CLI still imports SARIF, Brakeman, and GitLab reports directly.
 
 ## [0.1.0] - 2026-11-02
 

@@ -119,6 +119,7 @@ The `code-review-notes-lsp` extension supports the languages listed in `zed-exte
 
 ```json
 {
+  "file_types": { "Plain Text": ["sarif"] },
   "languages": {
     "Python": { "language_servers": ["code-review-notes", "..."] },
     "Markdown": { "language_servers": ["code-review-notes", "..."] },
@@ -128,7 +129,7 @@ The `code-review-notes-lsp` extension supports the languages listed in `zed-exte
 }
 ```
 
-The server's settings key remains `code-review-notes`, including under `lsp`. A `.sarif` file no longer has a language definition from this extension; in Zed 1.27.0 it opens as **Unknown**. Select **Plain Text** in Zed's language picker before using the import action. For another reviewable language, add its exact status-bar name to both `languages` and `opt_in_languages` in `zed-extension/extension.toml`, then reinstall the dev extension and opt in through settings. Zed versions that do not support `opt_in_languages` ignore it and start the server for all listed languages. Extensions cannot add keybindings; use **zed: open keymap file** to set your own:
+The server's settings key remains `code-review-notes`, including under `lsp`. A `.sarif` file no longer has a language definition from this extension; in Zed 1.27.0 it opens as **Unknown**. The `file_types` setting above makes it open as **Plain Text** so the server can attach. Alternatively, select **Plain Text** in Zed's language picker before using the import action. For another reviewable language already listed in `zed-extension/extension.toml`, opt in through settings. To support a language not yet listed, add its exact status-bar name to both `languages` and `opt_in_languages`, then reinstall the dev extension and opt in through settings. Zed versions that do not support `opt_in_languages` ignore it and start the server for all listed languages. Extensions cannot add keybindings; use **zed: open keymap file** to set your own:
 
 ```json
 [{ "context": "Editor", "bindings": { "cmd-alt-n": "editor::ToggleCodeActions" } }]

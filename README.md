@@ -12,7 +12,26 @@ Install [Rust](https://rustup.rs), then run this from the repository root:
 cargo install --path code-review-notes
 ```
 
-In Zed, run **zed: install dev extension** and select `zed-extension/` (extension ID `code-review-notes-lsp`). Trust the project if Zed opens it in Restricted Mode. Enable the server for the languages you use in [Zed settings](docs/reference.md#language-support). After changing Rust code, reinstall the CLI and restart the language server; after changing `zed-extension/`, reinstall the dev extension.
+In Zed, run **zed: install dev extension** and select `zed-extension/` (extension ID `code-review-notes-lsp`). Trust the project if Zed opens it in Restricted Mode.
+
+**Required: enable the server for each language where you want review notes.** Installing the extension alone does not enable its code actions. Run **zed: open settings file** and add the server key `code-review-notes` for your languages.
+
+**For `.sarif` import in Zed, add both settings:** enable `code-review-notes` for `Plain Text` under `languages`, and map the `sarif` file type to `Plain Text` under `file_types`. Without the file type mapping, Zed may open `.sarif` as **Unknown**, where the server cannot offer an import action. This example also enables notes in source files and import from `.json` reports:
+
+```json
+{
+  "file_types": { "Plain Text": ["sarif"] },
+  "languages": {
+    "JavaScript": { "language_servers": ["code-review-notes", "..."] },
+    "TypeScript": { "language_servers": ["code-review-notes", "..."] },
+    "Python": { "language_servers": ["code-review-notes", "..."] },
+    "JSON": { "language_servers": ["code-review-notes", "..."] },
+    "Plain Text": { "language_servers": ["code-review-notes", "..."] }
+  }
+}
+```
+
+Merge the `file_types` and `languages` entries into your existing settings; keep only the languages you use. The `"..."` keeps Zed's other language servers. **Use `Plain Text` for `.sarif` files, not `SARIF`:** this extension no longer defines a SARIF language. After saving settings, close and reopen the report and check that its language label says **Plain Text**. You can also select **Plain Text** from the language picker for an individual report instead of adding the file type mapping. Use `JSON` for `.json` scanner reports. See [language support](docs/reference.md#language-support) for details. After changing Rust code, reinstall the CLI and restart the language server; after changing `zed-extension/`, reinstall the dev extension.
 
 ## Use in Zed
 
@@ -33,7 +52,7 @@ New notes start as **Note**. Imported findings start as **Open**. **Open** appea
 
 Use either method in the project you scanned:
 
-- **In Zed:** Enable `code-review-notes` for **Plain Text** and/or **JSON** in [Zed settings](docs/reference.md#language-support). A `.sarif` report opens as **Unknown** in Zed 1.27.0; use the language picker to select **Plain Text**. Open a SARIF, Brakeman, or GitLab `.json` report as JSON. Right-click *inside the report editor* → **Show Code Actions** → **Import into Code Review Notes**. This extension no longer associates `.sarif` with a SARIF language or supplies its JSON highlighting.
+- **In Zed:** Enable `code-review-notes` for **Plain Text** and associate `.sarif` files with it using `"file_types": { "Plain Text": ["sarif"] }`; there is no `SARIF` settings entry. Alternatively, select **Plain Text** in the language picker when the file shows **Unknown**. Enable **JSON** separately for SARIF, Brakeman, or GitLab `.json` reports. Right-click *inside the report editor* → **Show Code Actions** → **Import into Code Review Notes**. This extension does not associate `.sarif` with a SARIF language or supply its JSON highlighting.
 - **CLI:** From the project root, run:
 
   ```sh
@@ -68,7 +87,7 @@ Agent access is optional and requires [adding the CLI as a local MCP server](doc
 ## Troubleshooting
 
 - **No import action for minified SARIF:** Zed disables language server features when a line exceeds its default limit of 20,000 characters. In **zed: open settings**, set `"global_lsp_settings": { "max_buffer_line_length": 400000 }` if that exceeds your report's longest line. Reopen the file. You can also pretty-print the report.
-- **No code actions:** Trust the project and check **dev: open language server logs** → *Code Review Notes*. Confirm the `code-review-notes` binary is installed and the file's current language explicitly enables the server. For an unrecognized file type, see [language support](docs/reference.md#language-support).
+- **No code actions:** First check that the file's current language explicitly enables `code-review-notes` in Zed settings. Installing the extension alone does not start this opt-in server. Then trust the project, confirm the `code-review-notes` binary is installed, and check **dev: open language server logs** → *Code Review Notes*. For an unrecognized file type, see [language support](docs/reference.md#language-support).
 - **Extension build fails:** See [build troubleshooting](docs/reference.md#build-troubleshooting).
 
 ## Safety

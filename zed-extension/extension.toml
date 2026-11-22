@@ -1,6 +1,6 @@
 id = "code-review-notes-lsp"
 name = "Code Review Notes"
-version = "0.1.0"
+version = "0.2.0"
 schema_version = 1
 authors = ["snoopysecurity <samsanoop@outlook.com>"]
 description = "Keep code review notes alongside your code and import security findings from SARIF reports."
